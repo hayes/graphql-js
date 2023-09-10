@@ -1349,7 +1349,9 @@ export const defaultTypeResolver = function (
         promisedIsTypeOfResults[i] = isTypeOfResult;
       } else if (isTypeOfResult) {
         if (promisedIsTypeOfResults.length > 0) {
-          return Promise.all(promisedIsTypeOfResults).then(() => type.name);
+          Promise.all(promisedIsTypeOfResults).then(undefined, () => {
+            /* ignore errors */
+          });
         }
         return type.name;
       }

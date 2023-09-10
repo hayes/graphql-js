@@ -174,12 +174,7 @@ function printInputObject(type) {
   const fields = Object.values(type.getFields()).map(
     (f, i) => printDescription(f, '  ', !i) + '  ' + printInputValue(f),
   );
-  return (
-    printDescription(type) +
-    `input ${type.name}` +
-    printOneOf(type.isOneOf) +
-    printBlock(fields)
-  );
+  return printDescription(type) + `input ${type.name}` + printBlock(fields);
 }
 function printFields(type) {
   const fields = Object.values(type.getFields()).map(
@@ -256,12 +251,6 @@ function printDeprecated(reason) {
     return ` @deprecated(reason: ${astValue})`;
   }
   return ' @deprecated';
-}
-function printOneOf(isOneOf) {
-  if (!isOneOf) {
-    return '';
-  }
-  return ' @oneOf';
 }
 function printSpecifiedByURL(scalar) {
   if (scalar.specifiedByURL == null) {
