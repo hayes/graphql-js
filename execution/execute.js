@@ -1381,6 +1381,9 @@ const defaultTypeResolver = function (value, contextValue, info, abstractType) {
       if ((0, isPromise_js_1.isPromise)(isTypeOfResult)) {
         promisedIsTypeOfResults[i] = isTypeOfResult;
       } else if (isTypeOfResult) {
+        if (promisedIsTypeOfResults.length > 0) {
+          return Promise.all(promisedIsTypeOfResults).then(() => type.name);
+        }
         return type.name;
       }
     }
