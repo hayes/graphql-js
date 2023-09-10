@@ -1,18 +1,31 @@
-export { pathToArray as responsePathAsArray } from '../jsutils/Path';
+export { pathToArray as responsePathAsArray } from '../jsutils/Path.js';
 export {
+  createSourceEventStream,
   execute,
+  experimentalExecuteIncrementally,
   executeSync,
   defaultFieldResolver,
   defaultTypeResolver,
-} from './execute';
+  subscribe,
+} from './execute.js';
+export type { ExecutionArgs } from './execute.js';
 export type {
-  ExecutionArgs,
   ExecutionResult,
+  ExperimentalIncrementalExecutionResults,
+  InitialIncrementalExecutionResult,
+  SubsequentIncrementalExecutionResult,
+  IncrementalDeferResult,
+  IncrementalStreamResult,
+  IncrementalResult,
   FormattedExecutionResult,
-} from './execute';
-export { subscribe, createSourceEventStream } from './subscribe';
+  FormattedInitialIncrementalExecutionResult,
+  FormattedSubsequentIncrementalExecutionResult,
+  FormattedIncrementalDeferResult,
+  FormattedIncrementalStreamResult,
+  FormattedIncrementalResult,
+} from './IncrementalPublisher.js';
 export {
   getArgumentValues,
   getVariableValues,
   getDirectiveValues,
-} from './values';
+} from './values.js';

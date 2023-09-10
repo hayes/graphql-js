@@ -1,11 +1,18 @@
+import { AccumulatorMap } from '../jsutils/AccumulatorMap.mjs';
+import { getBySet } from '../jsutils/getBySet.mjs';
+import { invariant } from '../jsutils/invariant.mjs';
+import { isSameSet } from '../jsutils/isSameSet.mjs';
+import { OperationTypeNode } from '../language/ast.mjs';
 import { Kind } from '../language/kinds.mjs';
 import { isAbstractType } from '../type/definition.mjs';
 import {
+  GraphQLDeferDirective,
   GraphQLIncludeDirective,
   GraphQLSkipDirective,
 } from '../type/directives.mjs';
 import { typeFromAST } from '../utilities/typeFromAST.mjs';
 import { getDirectiveValues } from './values.mjs';
+export const NON_DEFERRED_TARGET_SET = new Set([undefined]);
 /**
  * Given a selectionSet, collects all of the fields and returns them.
  *
@@ -15,25 +22,29 @@ import { getDirectiveValues } from './values.mjs';
  *
  * @internal
  */
-
 export function collectFields(
   schema,
   fragments,
   variableValues,
   runtimeType,
-  selectionSet,
+  operation,
 ) {
-  const fields = new Map();
-  collectFieldsImpl(
+  const context = {
     schema,
     fragments,
     variableValues,
     runtimeType,
-    selectionSet,
-    fields,
-    new Set(),
-  );
-  return fields;
+    operation,
+    fieldsByTarget: new Map(),
+    targetsByKey: new Map(),
+    newDeferUsages: [],
+    visitedFragmentNames: new Set(),
+  };
+  collectFieldsImpl(context, operation.selectionSet);
+  return {
+    ...buildGroupedFieldSets(context.targetsByKey, context.fieldsByTarget),
+    newDeferUsages: context.newDeferUsages,
+  };
 }
 /**
  * Given an array of field nodes, collects all of the subfields of the passed
@@ -45,62 +56,75 @@ export function collectFields(
  *
  * @internal
  */
-
+// eslint-disable-next-line max-params
 export function collectSubfields(
   schema,
   fragments,
   variableValues,
+  operation,
   returnType,
-  fieldNodes,
+  fieldGroup,
 ) {
-  const subFieldNodes = new Map();
-  const visitedFragmentNames = new Set();
-
-  for (const node of fieldNodes) {
+  const context = {
+    schema,
+    fragments,
+    variableValues,
+    runtimeType: returnType,
+    operation,
+    fieldsByTarget: new Map(),
+    targetsByKey: new Map(),
+    newDeferUsages: [],
+    visitedFragmentNames: new Set(),
+  };
+  for (const fieldDetails of fieldGroup.fields) {
+    const node = fieldDetails.node;
     if (node.selectionSet) {
-      collectFieldsImpl(
-        schema,
-        fragments,
-        variableValues,
-        returnType,
-        node.selectionSet,
-        subFieldNodes,
-        visitedFragmentNames,
-      );
+      collectFieldsImpl(context, node.selectionSet, fieldDetails.target);
     }
   }
-
-  return subFieldNodes;
+  return {
+    ...buildGroupedFieldSets(
+      context.targetsByKey,
+      context.fieldsByTarget,
+      fieldGroup.targets,
+    ),
+    newDeferUsages: context.newDeferUsages,
+  };
 }
-
-function collectFieldsImpl(
-  schema,
-  fragments,
-  variableValues,
-  runtimeType,
-  selectionSet,
-  fields,
-  visitedFragmentNames,
-) {
+function collectFieldsImpl(context, selectionSet, parentTarget, newTarget) {
+  const {
+    schema,
+    fragments,
+    variableValues,
+    runtimeType,
+    operation,
+    targetsByKey,
+    fieldsByTarget,
+    newDeferUsages,
+    visitedFragmentNames,
+  } = context;
   for (const selection of selectionSet.selections) {
     switch (selection.kind) {
       case Kind.FIELD: {
         if (!shouldIncludeNode(variableValues, selection)) {
           continue;
         }
-
-        const name = getFieldEntryKey(selection);
-        const fieldList = fields.get(name);
-
-        if (fieldList !== undefined) {
-          fieldList.push(selection);
-        } else {
-          fields.set(name, [selection]);
+        const key = getFieldEntryKey(selection);
+        const target = newTarget ?? parentTarget;
+        let keyTargets = targetsByKey.get(key);
+        if (keyTargets === undefined) {
+          keyTargets = new Set();
+          targetsByKey.set(key, keyTargets);
         }
-
+        keyTargets.add(target);
+        let targetFields = fieldsByTarget.get(target);
+        if (targetFields === undefined) {
+          targetFields = new AccumulatorMap();
+          fieldsByTarget.set(target, targetFields);
+        }
+        targetFields.add(key, selection);
         break;
       }
-
       case Kind.INLINE_FRAGMENT: {
         if (
           !shouldIncludeNode(variableValues, selection) ||
@@ -108,106 +132,226 @@ function collectFieldsImpl(
         ) {
           continue;
         }
-
+        const defer = getDeferValues(operation, variableValues, selection);
+        let target;
+        if (!defer) {
+          target = newTarget;
+        } else {
+          const ancestors =
+            parentTarget === undefined
+              ? [parentTarget]
+              : [parentTarget, ...parentTarget.ancestors];
+          target = { ...defer, ancestors };
+          newDeferUsages.push(target);
+        }
         collectFieldsImpl(
-          schema,
-          fragments,
-          variableValues,
-          runtimeType,
+          context,
           selection.selectionSet,
-          fields,
-          visitedFragmentNames,
+          parentTarget,
+          target,
         );
         break;
       }
-
       case Kind.FRAGMENT_SPREAD: {
         const fragName = selection.name.value;
-
-        if (
-          visitedFragmentNames.has(fragName) ||
-          !shouldIncludeNode(variableValues, selection)
-        ) {
+        if (!shouldIncludeNode(variableValues, selection)) {
           continue;
         }
-
-        visitedFragmentNames.add(fragName);
+        const defer = getDeferValues(operation, variableValues, selection);
+        if (visitedFragmentNames.has(fragName) && !defer) {
+          continue;
+        }
         const fragment = fragments[fragName];
-
         if (
-          !fragment ||
+          fragment == null ||
           !doesFragmentConditionMatch(schema, fragment, runtimeType)
         ) {
           continue;
         }
-
-        collectFieldsImpl(
-          schema,
-          fragments,
-          variableValues,
-          runtimeType,
-          fragment.selectionSet,
-          fields,
-          visitedFragmentNames,
-        );
+        let target;
+        if (!defer) {
+          visitedFragmentNames.add(fragName);
+          target = newTarget;
+        } else {
+          const ancestors =
+            parentTarget === undefined
+              ? [parentTarget]
+              : [parentTarget, ...parentTarget.ancestors];
+          target = { ...defer, ancestors };
+          newDeferUsages.push(target);
+        }
+        collectFieldsImpl(context, fragment.selectionSet, parentTarget, target);
         break;
       }
     }
   }
 }
 /**
+ * Returns an object containing the `@defer` arguments if a field should be
+ * deferred based on the experimental flag, defer directive present and
+ * not disabled by the "if" argument.
+ */
+function getDeferValues(operation, variableValues, node) {
+  const defer = getDirectiveValues(GraphQLDeferDirective, node, variableValues);
+  if (!defer) {
+    return;
+  }
+  if (defer.if === false) {
+    return;
+  }
+  operation.operation !== OperationTypeNode.SUBSCRIPTION ||
+    invariant(
+      false,
+      '`@defer` directive not supported on subscription operations. Disable `@defer` by setting the `if` argument to `false`.',
+    );
+  return {
+    label: typeof defer.label === 'string' ? defer.label : undefined,
+  };
+}
+/**
  * Determines if a field should be included based on the `@include` and `@skip`
  * directives, where `@skip` has higher precedence than `@include`.
  */
-
 function shouldIncludeNode(variableValues, node) {
   const skip = getDirectiveValues(GraphQLSkipDirective, node, variableValues);
-
-  if ((skip === null || skip === void 0 ? void 0 : skip.if) === true) {
+  if (skip?.if === true) {
     return false;
   }
-
   const include = getDirectiveValues(
     GraphQLIncludeDirective,
     node,
     variableValues,
   );
-
-  if (
-    (include === null || include === void 0 ? void 0 : include.if) === false
-  ) {
+  if (include?.if === false) {
     return false;
   }
-
   return true;
 }
 /**
  * Determines if a fragment is applicable to the given type.
  */
-
 function doesFragmentConditionMatch(schema, fragment, type) {
   const typeConditionNode = fragment.typeCondition;
-
   if (!typeConditionNode) {
     return true;
   }
-
   const conditionalType = typeFromAST(schema, typeConditionNode);
-
   if (conditionalType === type) {
     return true;
   }
-
   if (isAbstractType(conditionalType)) {
     return schema.isSubType(conditionalType, type);
   }
-
   return false;
 }
 /**
  * Implements the logic to compute the key of a given field's entry
  */
-
 function getFieldEntryKey(node) {
   return node.alias ? node.alias.value : node.name.value;
+}
+function buildGroupedFieldSets(
+  targetsByKey,
+  fieldsByTarget,
+  parentTargets = NON_DEFERRED_TARGET_SET,
+) {
+  const { parentTargetKeys, targetSetDetailsMap } = getTargetSetDetails(
+    targetsByKey,
+    parentTargets,
+  );
+  const groupedFieldSet =
+    parentTargetKeys.size > 0
+      ? getOrderedGroupedFieldSet(
+          parentTargetKeys,
+          parentTargets,
+          targetsByKey,
+          fieldsByTarget,
+        )
+      : new Map();
+  const newGroupedFieldSetDetails = new Map();
+  for (const [maskingTargets, targetSetDetails] of targetSetDetailsMap) {
+    const { keys, shouldInitiateDefer } = targetSetDetails;
+    const newGroupedFieldSet = getOrderedGroupedFieldSet(
+      keys,
+      maskingTargets,
+      targetsByKey,
+      fieldsByTarget,
+    );
+    // All TargetSets that causes new grouped field sets consist only of DeferUsages
+    // and have shouldInitiateDefer defined
+    newGroupedFieldSetDetails.set(maskingTargets, {
+      groupedFieldSet: newGroupedFieldSet,
+      shouldInitiateDefer,
+    });
+  }
+  return {
+    groupedFieldSet,
+    newGroupedFieldSetDetails,
+  };
+}
+function getTargetSetDetails(targetsByKey, parentTargets) {
+  const parentTargetKeys = new Set();
+  const targetSetDetailsMap = new Map();
+  for (const [responseKey, targets] of targetsByKey) {
+    const maskingTargetList = [];
+    for (const target of targets) {
+      if (
+        target === undefined ||
+        target.ancestors.every((ancestor) => !targets.has(ancestor))
+      ) {
+        maskingTargetList.push(target);
+      }
+    }
+    const maskingTargets = new Set(maskingTargetList);
+    if (isSameSet(maskingTargets, parentTargets)) {
+      parentTargetKeys.add(responseKey);
+      continue;
+    }
+    let targetSetDetails = getBySet(targetSetDetailsMap, maskingTargets);
+    if (targetSetDetails === undefined) {
+      targetSetDetails = {
+        keys: new Set(),
+        shouldInitiateDefer: maskingTargetList.some(
+          (deferUsage) => !parentTargets.has(deferUsage),
+        ),
+      };
+      targetSetDetailsMap.set(maskingTargets, targetSetDetails);
+    }
+    targetSetDetails.keys.add(responseKey);
+  }
+  return {
+    parentTargetKeys,
+    targetSetDetailsMap,
+  };
+}
+function getOrderedGroupedFieldSet(
+  keys,
+  maskingTargets,
+  targetsByKey,
+  fieldsByTarget,
+) {
+  const groupedFieldSet = new Map();
+  const firstTarget = maskingTargets.values().next().value;
+  // eslint-disable-next-line @typescript-eslint/no-non-null-assertion
+  const firstFields = fieldsByTarget.get(firstTarget);
+  for (const [key] of firstFields) {
+    if (keys.has(key)) {
+      let fieldGroup = groupedFieldSet.get(key);
+      if (fieldGroup === undefined) {
+        fieldGroup = { fields: [], targets: maskingTargets };
+        groupedFieldSet.set(key, fieldGroup);
+      }
+      // eslint-disable-next-line @typescript-eslint/no-non-null-assertion
+      for (const target of targetsByKey.get(key)) {
+        // eslint-disable-next-line @typescript-eslint/no-non-null-assertion
+        const fieldsForTarget = fieldsByTarget.get(target);
+        // eslint-disable-next-line @typescript-eslint/no-non-null-assertion
+        const nodes = fieldsForTarget.get(key);
+        // the following line is an optional minor optimization
+        fieldsForTarget.delete(key);
+        fieldGroup.fields.push(...nodes.map((node) => ({ node, target })));
+      }
+    }
+  }
+  return groupedFieldSet;
 }

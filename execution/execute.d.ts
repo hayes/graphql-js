@@ -1,23 +1,27 @@
-import type { Maybe } from '../jsutils/Maybe';
-import type { ObjMap } from '../jsutils/ObjMap';
-import type { Path } from '../jsutils/Path';
-import type { PromiseOrValue } from '../jsutils/PromiseOrValue';
-import type { GraphQLFormattedError } from '../error/GraphQLError';
-import { GraphQLError } from '../error/GraphQLError';
+import type { Maybe } from '../jsutils/Maybe.js';
+import type { ObjMap } from '../jsutils/ObjMap.js';
+import type { Path } from '../jsutils/Path.js';
+import type { PromiseOrValue } from '../jsutils/PromiseOrValue.js';
+import { GraphQLError } from '../error/GraphQLError.js';
 import type {
   DocumentNode,
-  FieldNode,
   FragmentDefinitionNode,
   OperationDefinitionNode,
-} from '../language/ast';
+} from '../language/ast.js';
 import type {
   GraphQLField,
   GraphQLFieldResolver,
   GraphQLObjectType,
   GraphQLResolveInfo,
   GraphQLTypeResolver,
-} from '../type/definition';
-import type { GraphQLSchema } from '../type/schema';
+} from '../type/definition.js';
+import type { GraphQLSchema } from '../type/schema.js';
+import type { FieldGroup } from './collectFields.js';
+import type {
+  ExecutionResult,
+  ExperimentalIncrementalExecutionResults,
+} from './IncrementalPublisher.js';
+import { IncrementalPublisher } from './IncrementalPublisher.js';
 /**
  * Terminology
  *
@@ -55,30 +59,7 @@ export interface ExecutionContext {
   fieldResolver: GraphQLFieldResolver<any, any>;
   typeResolver: GraphQLTypeResolver<any, any>;
   subscribeFieldResolver: GraphQLFieldResolver<any, any>;
-  errors: Array<GraphQLError>;
-}
-/**
- * The result of GraphQL execution.
- *
- *   - `errors` is included when any errors occurred as a non-empty array.
- *   - `data` is the result of a successful execution of the query.
- *   - `extensions` is reserved for adding non-standard properties.
- */
-export interface ExecutionResult<
-  TData = ObjMap<unknown>,
-  TExtensions = ObjMap<unknown>,
-> {
-  errors?: ReadonlyArray<GraphQLError>;
-  data?: TData | null;
-  extensions?: TExtensions;
-}
-export interface FormattedExecutionResult<
-  TData = ObjMap<unknown>,
-  TExtensions = ObjMap<unknown>,
-> {
-  errors?: ReadonlyArray<GraphQLFormattedError>;
-  data?: TData | null;
-  extensions?: TExtensions;
+  incrementalPublisher: IncrementalPublisher;
 }
 export interface ExecutionArgs {
   schema: GraphQLSchema;
@@ -93,6 +74,11 @@ export interface ExecutionArgs {
   typeResolver?: Maybe<GraphQLTypeResolver<any, any>>;
   subscribeFieldResolver?: Maybe<GraphQLFieldResolver<any, any>>;
 }
+export interface StreamUsage {
+  label: string | undefined;
+  initialCount: number;
+  fieldGroup: FieldGroup;
+}
 /**
  * Implements the "Executing requests" section of the GraphQL specification.
  *
@@ -102,10 +88,31 @@ export interface ExecutionArgs {
  *
  * If the arguments to this function do not result in a legal execution context,
  * a GraphQLError will be thrown immediately explaining the invalid input.
+ *
+ * This function does not support incremental delivery (`@defer` and `@stream`).
+ * If an operation which would defer or stream data is executed with this
+ * function, it will throw or return a rejected promise.
+ * Use `experimentalExecuteIncrementally` if you want to support incremental
+ * delivery.
  */
 export declare function execute(
   args: ExecutionArgs,
 ): PromiseOrValue<ExecutionResult>;
+/**
+ * Implements the "Executing requests" section of the GraphQL specification,
+ * including `@defer` and `@stream` as proposed in
+ * https://github.com/graphql/graphql-spec/pull/742
+ *
+ * This function returns a Promise of an ExperimentalIncrementalExecutionResults
+ * object. This object either consists of a single ExecutionResult, or an
+ * object containing an `initialResult` and a stream of `subsequentResults`.
+ *
+ * If the arguments to this function do not result in a legal execution context,
+ * a GraphQLError will be thrown immediately explaining the invalid input.
+ */
+export declare function experimentalExecuteIncrementally(
+  args: ExecutionArgs,
+): PromiseOrValue<ExecutionResult | ExperimentalIncrementalExecutionResults>;
 /**
  * Also implements the "Executing requests" section of the GraphQL specification.
  * However, it guarantees to complete synchronously (or throw an error) assuming
@@ -113,36 +120,25 @@ export declare function execute(
  */
 export declare function executeSync(args: ExecutionArgs): ExecutionResult;
 /**
- * Essential assertions before executing to provide developer feedback for
- * improper use of the GraphQL library.
- *
- * @internal
- */
-export declare function assertValidExecutionArguments(
-  schema: GraphQLSchema,
-  document: DocumentNode,
-  rawVariableValues: Maybe<{
-    readonly [variable: string]: unknown;
-  }>,
-): void;
-/**
  * Constructs a ExecutionContext object from the arguments passed to
  * execute, which we will pass throughout the other execution methods.
  *
  * Throws a GraphQLError if a valid execution context cannot be created.
  *
+ * TODO: consider no longer exporting this function
  * @internal
  */
 export declare function buildExecutionContext(
   args: ExecutionArgs,
 ): ReadonlyArray<GraphQLError> | ExecutionContext;
 /**
+ * TODO: consider no longer exporting this function
  * @internal
  */
 export declare function buildResolveInfo(
   exeContext: ExecutionContext,
   fieldDef: GraphQLField<unknown, unknown>,
-  fieldNodes: ReadonlyArray<FieldNode>,
+  fieldGroup: FieldGroup,
   parentType: GraphQLObjectType,
   path: Path,
 ): GraphQLResolveInfo;
@@ -168,18 +164,64 @@ export declare const defaultFieldResolver: GraphQLFieldResolver<
   unknown
 >;
 /**
- * This method looks up the field on the given type definition.
- * It has special casing for the three introspection fields,
- * __schema, __type and __typename. __typename is special because
- * it can always be queried as a field, even in situations where no
- * other fields are allowed, like on a Union. __schema and __type
- * could get automatically added to the query type, but that would
- * require mutating type definitions, which would cause issues.
+ * Implements the "Subscribe" algorithm described in the GraphQL specification.
  *
- * @internal
+ * Returns a Promise which resolves to either an AsyncIterator (if successful)
+ * or an ExecutionResult (error). The promise will be rejected if the schema or
+ * other arguments to this function are invalid, or if the resolved event stream
+ * is not an async iterable.
+ *
+ * If the client-provided arguments to this function do not result in a
+ * compliant subscription, a GraphQL Response (ExecutionResult) with descriptive
+ * errors and no data will be returned.
+ *
+ * If the source stream could not be created due to faulty subscription resolver
+ * logic or underlying systems, the promise will resolve to a single
+ * ExecutionResult containing `errors` and no `data`.
+ *
+ * If the operation succeeded, the promise resolves to an AsyncIterator, which
+ * yields a stream of ExecutionResults representing the response stream.
+ *
+ * This function does not support incremental delivery (`@defer` and `@stream`).
+ * If an operation which would defer or stream data is executed with this
+ * function, a field error will be raised at the location of the `@defer` or
+ * `@stream` directive.
+ *
+ * Accepts an object with named arguments.
  */
-export declare function getFieldDef(
-  schema: GraphQLSchema,
-  parentType: GraphQLObjectType,
-  fieldNode: FieldNode,
-): Maybe<GraphQLField<unknown, unknown>>;
+export declare function subscribe(
+  args: ExecutionArgs,
+): PromiseOrValue<
+  AsyncGenerator<ExecutionResult, void, void> | ExecutionResult
+>;
+/**
+ * Implements the "CreateSourceEventStream" algorithm described in the
+ * GraphQL specification, resolving the subscription source event stream.
+ *
+ * Returns a Promise which resolves to either an AsyncIterable (if successful)
+ * or an ExecutionResult (error). The promise will be rejected if the schema or
+ * other arguments to this function are invalid, or if the resolved event stream
+ * is not an async iterable.
+ *
+ * If the client-provided arguments to this function do not result in a
+ * compliant subscription, a GraphQL Response (ExecutionResult) with
+ * descriptive errors and no data will be returned.
+ *
+ * If the the source stream could not be created due to faulty subscription
+ * resolver logic or underlying systems, the promise will resolve to a single
+ * ExecutionResult containing `errors` and no `data`.
+ *
+ * If the operation succeeded, the promise resolves to the AsyncIterable for the
+ * event stream returned by the resolver.
+ *
+ * A Source Event Stream represents a sequence of events, each of which triggers
+ * a GraphQL execution for that event.
+ *
+ * This may be useful when hosting the stateful subscription service in a
+ * different process or machine than the stateless GraphQL execution engine,
+ * or otherwise separating these two steps. For more on this, see the
+ * "Supporting Subscriptions at Scale" information in the GraphQL specification.
+ */
+export declare function createSourceEventStream(
+  args: ExecutionArgs,
+): PromiseOrValue<AsyncIterable<unknown> | ExecutionResult>;
