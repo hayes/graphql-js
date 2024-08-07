@@ -5,6 +5,7 @@ import type { PromiseOrValue } from '../jsutils/PromiseOrValue.js';
 import { GraphQLError } from '../error/GraphQLError.js';
 import type {
   DocumentNode,
+  FieldNode,
   FragmentDefinitionNode,
   OperationDefinitionNode,
 } from '../language/ast.js';
@@ -18,10 +19,10 @@ import type {
 import type { GraphQLSchema } from '../type/schema.js';
 import type { FieldGroup } from './collectFields.js';
 import type {
+  CancellableStreamRecord,
   ExecutionResult,
   ExperimentalIncrementalExecutionResults,
-} from './IncrementalPublisher.js';
-import { IncrementalPublisher } from './IncrementalPublisher.js';
+} from './types.js';
 /**
  * Terminology
  *
@@ -59,7 +60,9 @@ export interface ExecutionContext {
   fieldResolver: GraphQLFieldResolver<any, any>;
   typeResolver: GraphQLTypeResolver<any, any>;
   subscribeFieldResolver: GraphQLFieldResolver<any, any>;
-  incrementalPublisher: IncrementalPublisher;
+  enableEarlyExecution: boolean;
+  errors: Array<GraphQLError> | undefined;
+  cancellableStreams: Set<CancellableStreamRecord> | undefined;
 }
 export interface ExecutionArgs {
   schema: GraphQLSchema;
@@ -73,6 +76,7 @@ export interface ExecutionArgs {
   fieldResolver?: Maybe<GraphQLFieldResolver<any, any>>;
   typeResolver?: Maybe<GraphQLTypeResolver<any, any>>;
   subscribeFieldResolver?: Maybe<GraphQLFieldResolver<any, any>>;
+  enableEarlyExecution?: Maybe<boolean>;
 }
 export interface StreamUsage {
   label: string | undefined;
@@ -138,7 +142,7 @@ export declare function buildExecutionContext(
 export declare function buildResolveInfo(
   exeContext: ExecutionContext,
   fieldDef: GraphQLField<unknown, unknown>,
-  fieldGroup: FieldGroup,
+  fieldNodes: ReadonlyArray<FieldNode>,
   parentType: GraphQLObjectType,
   path: Path,
 ): GraphQLResolveInfo;

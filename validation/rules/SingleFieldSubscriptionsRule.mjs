@@ -2,7 +2,7 @@ import { GraphQLError } from '../../error/GraphQLError.mjs';
 import { Kind } from '../../language/kinds.mjs';
 import { collectFields } from '../../execution/collectFields.mjs';
 function toNodes(fieldGroup) {
-  return fieldGroup.fields.map((fieldDetails) => fieldDetails.node);
+  return fieldGroup.map((fieldDetails) => fieldDetails.node);
 }
 /**
  * Subscriptions must only include a non-introspection field.

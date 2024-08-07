@@ -5,7 +5,7 @@ const GraphQLError_js_1 = require('../../error/GraphQLError.js');
 const kinds_js_1 = require('../../language/kinds.js');
 const collectFields_js_1 = require('../../execution/collectFields.js');
 function toNodes(fieldGroup) {
-  return fieldGroup.fields.map((fieldDetails) => fieldDetails.node);
+  return fieldGroup.map((fieldDetails) => fieldDetails.node);
 }
 /**
  * Subscriptions must only include a non-introspection field.
