@@ -1,3 +1,4 @@
+import { BoxedPromiseOrValue } from '../jsutils/BoxedPromiseOrValue.ts';
 import { inspect } from '../jsutils/inspect.ts';
 import { invariant } from '../jsutils/invariant.ts';
 import { isAsyncIterable } from '../jsutils/isAsyncIterable.ts';
@@ -43,32 +44,31 @@ import {
 import { GraphQLStreamDirective } from '../type/directives.ts';
 import type { GraphQLSchema } from '../type/schema.ts';
 import { assertValidSchema } from '../type/validate.ts';
+import type { DeferUsageSet, ExecutionPlan } from './buildExecutionPlan.ts';
+import { buildExecutionPlan } from './buildExecutionPlan.ts';
 import type {
   DeferUsage,
-  DeferUsageSet,
   FieldGroup,
   GroupedFieldSet,
-  GroupedFieldSetDetails,
 } from './collectFields.ts';
 import {
   collectFields,
   collectSubfields as _collectSubfields,
-  NON_DEFERRED_TARGET_SET,
 } from './collectFields.ts';
+import { buildIncrementalResponse } from './IncrementalPublisher.ts';
+import { mapAsyncIterable } from './mapAsyncIterable.ts';
 import type {
+  CancellableStreamRecord,
+  CompletedExecutionGroup,
   ExecutionResult,
   ExperimentalIncrementalExecutionResults,
   IncrementalDataRecord,
-} from './IncrementalPublisher.ts';
-import {
-  DeferredFragmentRecord,
-  DeferredGroupedFieldSetRecord,
-  IncrementalPublisher,
-  InitialResultRecord,
-  StreamItemsRecord,
+  PendingExecutionGroup,
+  StreamItemRecord,
+  StreamItemResult,
   StreamRecord,
-} from './IncrementalPublisher.ts';
-import { mapAsyncIterable } from './mapAsyncIterable.ts';
+} from './types.ts';
+import { DeferredFragmentRecord } from './types.ts';
 import {
   getArgumentValues,
   getDirectiveValues,
@@ -134,7 +134,13 @@ export interface ExecutionContext {
   fieldResolver: GraphQLFieldResolver<any, any>;
   typeResolver: GraphQLTypeResolver<any, any>;
   subscribeFieldResolver: GraphQLFieldResolver<any, any>;
-  incrementalPublisher: IncrementalPublisher;
+  enableEarlyExecution: boolean;
+  errors: Array<GraphQLError> | undefined;
+  cancellableStreams: Set<CancellableStreamRecord> | undefined;
+}
+interface IncrementalContext {
+  errors: Array<GraphQLError> | undefined;
+  deferUsageSet?: DeferUsageSet | undefined;
 }
 export interface ExecutionArgs {
   schema: GraphQLSchema;
@@ -148,12 +154,14 @@ export interface ExecutionArgs {
   fieldResolver?: Maybe<GraphQLFieldResolver<any, any>>;
   typeResolver?: Maybe<GraphQLTypeResolver<any, any>>;
   subscribeFieldResolver?: Maybe<GraphQLFieldResolver<any, any>>;
+  enableEarlyExecution?: Maybe<boolean>;
 }
 export interface StreamUsage {
   label: string | undefined;
   initialCount: number;
   fieldGroup: FieldGroup;
 }
+type GraphQLWrappedResult<T> = [T, Array<IncrementalDataRecord> | undefined];
 const UNEXPECTED_EXPERIMENTAL_DIRECTIVES =
   'The provided schema unexpectedly contains experimental directives (@defer or @stream). These directives may only be utilized if experimental execution features are explicitly enabled.';
 const UNEXPECTED_MULTIPLE_PAYLOADS =
@@ -218,38 +226,151 @@ export function experimentalExecuteIncrementally(
   if (!('schema' in exeContext)) {
     return { errors: exeContext };
   }
-  return executeImpl(exeContext);
+  return executeOperation(exeContext);
 }
-function executeImpl(
+/**
+ * Implements the "Executing operations" section of the spec.
+ *
+ * Returns a Promise that will eventually resolve to the data described by
+ * The "Response" section of the GraphQL specification.
+ *
+ * If errors are encountered while executing a GraphQL field, only that
+ * field and its descendants will be omitted, and sibling fields will still
+ * be executed. An execution which encounters errors will still result in a
+ * resolved Promise.
+ *
+ * Errors from sub-fields of a NonNull type may propagate to the top level,
+ * at which point we still log the error and null the parent field, which
+ * in this case is the entire response.
+ */
+function executeOperation(
   exeContext: ExecutionContext,
 ): PromiseOrValue<ExecutionResult | ExperimentalIncrementalExecutionResults> {
-  // Return a Promise that will eventually resolve to the data described by
-  // The "Response" section of the GraphQL specification.
-  //
-  // If errors are encountered while executing a GraphQL field, only that
-  // field and its descendants will be omitted, and sibling fields will still
-  // be executed. An execution which encounters errors will still result in a
-  // resolved Promise.
-  //
-  // Errors from sub-fields of a NonNull type may propagate to the top level,
-  // at which point we still log the error and null the parent field, which
-  // in this case is the entire response.
-  const incrementalPublisher = exeContext.incrementalPublisher;
-  const initialResultRecord = new InitialResultRecord();
   try {
-    const data = executeOperation(exeContext, initialResultRecord);
-    if (isPromise(data)) {
-      return data.then(
-        (resolved) =>
-          incrementalPublisher.buildDataResponse(initialResultRecord, resolved),
-        (error) =>
-          incrementalPublisher.buildErrorResponse(initialResultRecord, error),
+    const { operation, schema, fragments, variableValues, rootValue } =
+      exeContext;
+    const rootType = schema.getRootType(operation.operation);
+    if (rootType == null) {
+      throw new GraphQLError(
+        `Schema is not configured to execute ${operation.operation} operation.`,
+        { nodes: operation },
       );
     }
-    return incrementalPublisher.buildDataResponse(initialResultRecord, data);
+    const collectedFields = collectFields(
+      schema,
+      fragments,
+      variableValues,
+      rootType,
+      operation,
+    );
+    let groupedFieldSet = collectedFields.groupedFieldSet;
+    const newDeferUsages = collectedFields.newDeferUsages;
+    let graphqlWrappedResult: PromiseOrValue<
+      GraphQLWrappedResult<ObjMap<unknown>>
+    >;
+    if (newDeferUsages.length === 0) {
+      graphqlWrappedResult = executeRootGroupedFieldSet(
+        exeContext,
+        operation.operation,
+        rootType,
+        rootValue,
+        groupedFieldSet,
+        undefined,
+      );
+    } else {
+      const executionPlan = buildExecutionPlan(groupedFieldSet);
+      groupedFieldSet = executionPlan.groupedFieldSet;
+      const newGroupedFieldSets = executionPlan.newGroupedFieldSets;
+      const newDeferMap = addNewDeferredFragments(newDeferUsages, new Map());
+      graphqlWrappedResult = executeRootGroupedFieldSet(
+        exeContext,
+        operation.operation,
+        rootType,
+        rootValue,
+        groupedFieldSet,
+        newDeferMap,
+      );
+      if (newGroupedFieldSets.size > 0) {
+        const newPendingExecutionGroups = collectExecutionGroups(
+          exeContext,
+          rootType,
+          rootValue,
+          undefined,
+          undefined,
+          newGroupedFieldSets,
+          newDeferMap,
+        );
+        graphqlWrappedResult = withNewExecutionGroups(
+          graphqlWrappedResult,
+          newPendingExecutionGroups,
+        );
+      }
+    }
+    if (isPromise(graphqlWrappedResult)) {
+      return graphqlWrappedResult.then(
+        (resolved) => buildDataResponse(exeContext, resolved[0], resolved[1]),
+        (error) => ({
+          data: null,
+          errors: withError(exeContext.errors, error),
+        }),
+      );
+    }
+    return buildDataResponse(
+      exeContext,
+      graphqlWrappedResult[0],
+      graphqlWrappedResult[1],
+    );
   } catch (error) {
-    return incrementalPublisher.buildErrorResponse(initialResultRecord, error);
+    return { data: null, errors: withError(exeContext.errors, error) };
   }
+}
+function withNewExecutionGroups(
+  result: PromiseOrValue<GraphQLWrappedResult<ObjMap<unknown>>>,
+  newPendingExecutionGroups: ReadonlyArray<PendingExecutionGroup>,
+): PromiseOrValue<GraphQLWrappedResult<ObjMap<unknown>>> {
+  if (isPromise(result)) {
+    return result.then((resolved) => {
+      addIncrementalDataRecords(resolved, newPendingExecutionGroups);
+      return resolved;
+    });
+  }
+  addIncrementalDataRecords(result, newPendingExecutionGroups);
+  return result;
+}
+function addIncrementalDataRecords(
+  graphqlWrappedResult: GraphQLWrappedResult<unknown>,
+  incrementalDataRecords: ReadonlyArray<IncrementalDataRecord> | undefined,
+): void {
+  if (incrementalDataRecords === undefined) {
+    return;
+  }
+  if (graphqlWrappedResult[1] === undefined) {
+    graphqlWrappedResult[1] = [...incrementalDataRecords];
+  } else {
+    graphqlWrappedResult[1].push(...incrementalDataRecords);
+  }
+}
+function withError(
+  errors: Array<GraphQLError> | undefined,
+  error: GraphQLError,
+): ReadonlyArray<GraphQLError> {
+  return errors === undefined ? [error] : [...errors, error];
+}
+function buildDataResponse(
+  exeContext: ExecutionContext,
+  data: ObjMap<unknown>,
+  incrementalDataRecords: ReadonlyArray<IncrementalDataRecord> | undefined,
+): ExecutionResult | ExperimentalIncrementalExecutionResults {
+  const errors = exeContext.errors;
+  if (incrementalDataRecords === undefined) {
+    return errors !== undefined ? { errors, data } : { data };
+  }
+  return buildIncrementalResponse(
+    exeContext,
+    data,
+    errors,
+    incrementalDataRecords,
+  );
 }
 /**
  * Also implements the "Executing requests" section of the GraphQL specification.
@@ -286,6 +407,7 @@ export function buildExecutionContext(
     fieldResolver,
     typeResolver,
     subscribeFieldResolver,
+    enableEarlyExecution,
   } = args;
   // If the schema used for execution is invalid, throw an error.
   assertValidSchema(schema);
@@ -342,7 +464,9 @@ export function buildExecutionContext(
     fieldResolver: fieldResolver ?? defaultFieldResolver,
     typeResolver: typeResolver ?? defaultTypeResolver,
     subscribeFieldResolver: subscribeFieldResolver ?? defaultFieldResolver,
-    incrementalPublisher: new IncrementalPublisher(),
+    enableEarlyExecution: enableEarlyExecution === true,
+    errors: undefined,
+    cancellableStreams: undefined,
   };
 }
 function buildPerEventExecutionContext(
@@ -352,90 +476,51 @@ function buildPerEventExecutionContext(
   return {
     ...exeContext,
     rootValue: payload,
+    errors: undefined,
   };
 }
-/**
- * Implements the "Executing operations" section of the spec.
- */
-function executeOperation(
+function executeRootGroupedFieldSet(
   exeContext: ExecutionContext,
-  initialResultRecord: InitialResultRecord,
-): PromiseOrValue<ObjMap<unknown>> {
-  const {
-    operation,
-    schema,
-    fragments,
-    variableValues,
-    rootValue,
-    incrementalPublisher,
-  } = exeContext;
-  const rootType = schema.getRootType(operation.operation);
-  if (rootType == null) {
-    throw new GraphQLError(
-      `Schema is not configured to execute ${operation.operation} operation.`,
-      { nodes: operation },
-    );
-  }
-  const { groupedFieldSet, newGroupedFieldSetDetails, newDeferUsages } =
-    collectFields(schema, fragments, variableValues, rootType, operation);
-  const newDeferMap = addNewDeferredFragments(
-    incrementalPublisher,
-    newDeferUsages,
-    initialResultRecord,
-  );
-  const path = undefined;
-  const newDeferredGroupedFieldSetRecords = addNewDeferredGroupedFieldSets(
-    incrementalPublisher,
-    newGroupedFieldSetDetails,
-    newDeferMap,
-    path,
-  );
-  let result;
-  switch (operation.operation) {
+  operation: OperationTypeNode,
+  rootType: GraphQLObjectType,
+  rootValue: unknown,
+  groupedFieldSet: GroupedFieldSet,
+  deferMap: ReadonlyMap<DeferUsage, DeferredFragmentRecord> | undefined,
+): PromiseOrValue<GraphQLWrappedResult<ObjMap<unknown>>> {
+  switch (operation) {
     case OperationTypeNode.QUERY:
-      result = executeFields(
+      return executeFields(
         exeContext,
         rootType,
         rootValue,
-        path,
+        undefined,
         groupedFieldSet,
-        initialResultRecord,
-        newDeferMap,
+        undefined,
+        deferMap,
       );
-      break;
     case OperationTypeNode.MUTATION:
-      result = executeFieldsSerially(
+      return executeFieldsSerially(
         exeContext,
         rootType,
         rootValue,
-        path,
+        undefined,
         groupedFieldSet,
-        initialResultRecord,
-        newDeferMap,
+        undefined,
+        deferMap,
       );
-      break;
     case OperationTypeNode.SUBSCRIPTION:
       // TODO: deprecate `subscribe` and move all logic here
       // Temporary solution until we finish merging execute and subscribe together
-      result = executeFields(
+      return executeFields(
         exeContext,
         rootType,
         rootValue,
-        path,
+        undefined,
         groupedFieldSet,
-        initialResultRecord,
-        newDeferMap,
+        undefined,
+        deferMap,
       );
   }
-  executeDeferredGroupedFieldSets(
-    exeContext,
-    rootType,
-    rootValue,
-    path,
-    newDeferredGroupedFieldSetRecords,
-    newDeferMap,
-  );
-  return result;
 }
 /**
  * Implements the "Executing selection sets" section of the spec
@@ -447,12 +532,12 @@ function executeFieldsSerially(
   sourceValue: unknown,
   path: Path | undefined,
   groupedFieldSet: GroupedFieldSet,
-  incrementalDataRecord: InitialResultRecord,
-  deferMap: ReadonlyMap<DeferUsage, DeferredFragmentRecord>,
-): PromiseOrValue<ObjMap<unknown>> {
+  incrementalContext: IncrementalContext | undefined,
+  deferMap: ReadonlyMap<DeferUsage, DeferredFragmentRecord> | undefined,
+): PromiseOrValue<GraphQLWrappedResult<ObjMap<unknown>>> {
   return promiseReduce(
     groupedFieldSet,
-    (results, [responseName, fieldGroup]) => {
+    (graphqlWrappedResult, [responseName, fieldGroup]) => {
       const fieldPath = addPath(path, responseName, parentType.name);
       const result = executeField(
         exeContext,
@@ -460,22 +545,24 @@ function executeFieldsSerially(
         sourceValue,
         fieldGroup,
         fieldPath,
-        incrementalDataRecord,
+        incrementalContext,
         deferMap,
       );
       if (result === undefined) {
-        return results;
+        return graphqlWrappedResult;
       }
       if (isPromise(result)) {
-        return result.then((resolvedResult) => {
-          results[responseName] = resolvedResult;
-          return results;
+        return result.then((resolved) => {
+          graphqlWrappedResult[0][responseName] = resolved[0];
+          addIncrementalDataRecords(graphqlWrappedResult, resolved[1]);
+          return graphqlWrappedResult;
         });
       }
-      results[responseName] = result;
-      return results;
+      graphqlWrappedResult[0][responseName] = result[0];
+      addIncrementalDataRecords(graphqlWrappedResult, result[1]);
+      return graphqlWrappedResult;
     },
-    Object.create(null),
+    [Object.create(null), undefined] as GraphQLWrappedResult<ObjMap<unknown>>,
   );
 }
 /**
@@ -488,10 +575,14 @@ function executeFields(
   sourceValue: unknown,
   path: Path | undefined,
   groupedFieldSet: GroupedFieldSet,
-  incrementalDataRecord: IncrementalDataRecord,
-  deferMap: ReadonlyMap<DeferUsage, DeferredFragmentRecord>,
-): PromiseOrValue<ObjMap<unknown>> {
+  incrementalContext: IncrementalContext | undefined,
+  deferMap: ReadonlyMap<DeferUsage, DeferredFragmentRecord> | undefined,
+): PromiseOrValue<GraphQLWrappedResult<ObjMap<unknown>>> {
   const results = Object.create(null);
+  const graphqlWrappedResult: GraphQLWrappedResult<ObjMap<unknown>> = [
+    results,
+    undefined,
+  ];
   let containsPromise = false;
   try {
     for (const [responseName, fieldGroup] of groupedFieldSet) {
@@ -502,36 +593,47 @@ function executeFields(
         sourceValue,
         fieldGroup,
         fieldPath,
-        incrementalDataRecord,
+        incrementalContext,
         deferMap,
       );
       if (result !== undefined) {
-        results[responseName] = result;
         if (isPromise(result)) {
+          results[responseName] = result.then((resolved) => {
+            addIncrementalDataRecords(graphqlWrappedResult, resolved[1]);
+            return resolved[0];
+          });
           containsPromise = true;
+        } else {
+          results[responseName] = result[0];
+          addIncrementalDataRecords(graphqlWrappedResult, result[1]);
         }
       }
     }
   } catch (error) {
     if (containsPromise) {
       // Ensure that any promises returned by other fields are handled, as they may also reject.
-      return promiseForObject(results).finally(() => {
+      return promiseForObject(results, () => {
+        /* noop */
+      }).finally(() => {
         throw error;
-      });
+      }) as never;
     }
     throw error;
   }
-  // If there are no promises, we can just return the object
+  // If there are no promises, we can just return the object and any incrementalDataRecords
   if (!containsPromise) {
-    return results;
+    return graphqlWrappedResult;
   }
   // Otherwise, results is a map from field name to the result of resolving that
   // field, which is possibly a promise. Return a promise that will return this
   // same map, but with any promises replaced with the values they resolved to.
-  return promiseForObject(results);
+  return promiseForObject(results, (resolved) => [
+    resolved,
+    graphqlWrappedResult[1],
+  ]);
 }
 function toNodes(fieldGroup: FieldGroup): ReadonlyArray<FieldNode> {
-  return fieldGroup.fields.map((fieldDetails) => fieldDetails.node);
+  return fieldGroup.map((fieldDetails) => fieldDetails.node);
 }
 /**
  * Implements the "Executing fields" section of the spec
@@ -545,10 +647,10 @@ function executeField(
   source: unknown,
   fieldGroup: FieldGroup,
   path: Path,
-  incrementalDataRecord: IncrementalDataRecord,
-  deferMap: ReadonlyMap<DeferUsage, DeferredFragmentRecord>,
-): PromiseOrValue<unknown> {
-  const fieldName = fieldGroup.fields[0].node.name.value;
+  incrementalContext: IncrementalContext | undefined,
+  deferMap: ReadonlyMap<DeferUsage, DeferredFragmentRecord> | undefined,
+): PromiseOrValue<GraphQLWrappedResult<unknown>> | undefined {
+  const fieldName = fieldGroup[0].node.name.value;
   const fieldDef = exeContext.schema.getField(parentType, fieldName);
   if (!fieldDef) {
     return;
@@ -558,7 +660,7 @@ function executeField(
   const info = buildResolveInfo(
     exeContext,
     fieldDef,
-    fieldGroup,
+    toNodes(fieldGroup),
     parentType,
     path,
   );
@@ -569,7 +671,7 @@ function executeField(
     // TODO: find a way to memoize, in case this field is within a List type.
     const args = getArgumentValues(
       fieldDef,
-      fieldGroup.fields[0].node,
+      fieldGroup[0].node,
       exeContext.variableValues,
     );
     // The resolve function's optional third argument is a context value that
@@ -585,7 +687,7 @@ function executeField(
         info,
         path,
         result,
-        incrementalDataRecord,
+        incrementalContext,
         deferMap,
       );
     }
@@ -596,7 +698,7 @@ function executeField(
       info,
       path,
       result,
-      incrementalDataRecord,
+      incrementalContext,
       deferMap,
     );
     if (isPromise(completed)) {
@@ -609,10 +711,9 @@ function executeField(
           returnType,
           fieldGroup,
           path,
-          incrementalDataRecord,
+          incrementalContext,
         );
-        exeContext.incrementalPublisher.filter(path, incrementalDataRecord);
-        return null;
+        return [null, undefined];
       });
     }
     return completed;
@@ -623,10 +724,9 @@ function executeField(
       returnType,
       fieldGroup,
       path,
-      incrementalDataRecord,
+      incrementalContext,
     );
-    exeContext.incrementalPublisher.filter(path, incrementalDataRecord);
-    return null;
+    return [null, undefined];
   }
 }
 /**
@@ -636,7 +736,7 @@ function executeField(
 export function buildResolveInfo(
   exeContext: ExecutionContext,
   fieldDef: GraphQLField<unknown, unknown>,
-  fieldGroup: FieldGroup,
+  fieldNodes: ReadonlyArray<FieldNode>,
   parentType: GraphQLObjectType,
   path: Path,
 ): GraphQLResolveInfo {
@@ -644,7 +744,7 @@ export function buildResolveInfo(
   // information about the current execution state.
   return {
     fieldName: fieldDef.name,
-    fieldNodes: toNodes(fieldGroup),
+    fieldNodes,
     returnType: fieldDef.type,
     parentType,
     path,
@@ -661,7 +761,7 @@ function handleFieldError(
   returnType: GraphQLOutputType,
   fieldGroup: FieldGroup,
   path: Path,
-  incrementalDataRecord: IncrementalDataRecord,
+  incrementalContext: IncrementalContext | undefined,
 ): void {
   const error = locatedError(rawError, toNodes(fieldGroup), pathToArray(path));
   // If the field type is non-nullable, then it is resolved without any
@@ -671,7 +771,13 @@ function handleFieldError(
   }
   // Otherwise, error protection is applied, logging the error and resolving
   // a null value for this field if one is encountered.
-  exeContext.incrementalPublisher.addFieldError(incrementalDataRecord, error);
+  const context = incrementalContext ?? exeContext;
+  let errors = context.errors;
+  if (errors === undefined) {
+    errors = [];
+    context.errors = errors;
+  }
+  errors.push(error);
 }
 /**
  * Implements the instructions for completeValue as defined in the
@@ -701,9 +807,9 @@ function completeValue(
   info: GraphQLResolveInfo,
   path: Path,
   result: unknown,
-  incrementalDataRecord: IncrementalDataRecord,
-  deferMap: ReadonlyMap<DeferUsage, DeferredFragmentRecord>,
-): PromiseOrValue<unknown> {
+  incrementalContext: IncrementalContext | undefined,
+  deferMap: ReadonlyMap<DeferUsage, DeferredFragmentRecord> | undefined,
+): PromiseOrValue<GraphQLWrappedResult<unknown>> {
   // If result is an Error, throw a located error.
   if (result instanceof Error) {
     throw result;
@@ -718,10 +824,10 @@ function completeValue(
       info,
       path,
       result,
-      incrementalDataRecord,
+      incrementalContext,
       deferMap,
     );
-    if (completed === null) {
+    if ((completed as GraphQLWrappedResult<unknown>)[0] === null) {
       throw new Error(
         `Cannot return null for non-nullable field ${info.parentType.name}.${info.fieldName}.`,
       );
@@ -730,7 +836,7 @@ function completeValue(
   }
   // If result value is null or undefined then return null.
   if (result == null) {
-    return null;
+    return [null, undefined];
   }
   // If field type is List, complete each item in the list with the inner type
   if (isListType(returnType)) {
@@ -741,14 +847,14 @@ function completeValue(
       info,
       path,
       result,
-      incrementalDataRecord,
+      incrementalContext,
       deferMap,
     );
   }
   // If field type is a leaf type, Scalar or Enum, serialize to a valid value,
   // returning null if serialization is not possible.
   if (isLeafType(returnType)) {
-    return completeLeafValue(returnType, result);
+    return [completeLeafValue(returnType, result), undefined];
   }
   // If field type is an abstract type, Interface or Union, determine the
   // runtime Object type and complete for that type.
@@ -760,7 +866,7 @@ function completeValue(
       info,
       path,
       result,
-      incrementalDataRecord,
+      incrementalContext,
       deferMap,
     );
   }
@@ -773,7 +879,7 @@ function completeValue(
       info,
       path,
       result,
-      incrementalDataRecord,
+      incrementalContext,
       deferMap,
     );
   }
@@ -792,9 +898,9 @@ async function completePromisedValue(
   info: GraphQLResolveInfo,
   path: Path,
   result: Promise<unknown>,
-  incrementalDataRecord: IncrementalDataRecord,
-  deferMap: ReadonlyMap<DeferUsage, DeferredFragmentRecord>,
-): Promise<unknown> {
+  incrementalContext: IncrementalContext | undefined,
+  deferMap: ReadonlyMap<DeferUsage, DeferredFragmentRecord> | undefined,
+): Promise<GraphQLWrappedResult<unknown>> {
   try {
     const resolved = await result;
     let completed = completeValue(
@@ -804,7 +910,7 @@ async function completePromisedValue(
       info,
       path,
       resolved,
-      incrementalDataRecord,
+      incrementalContext,
       deferMap,
     );
     if (isPromise(completed)) {
@@ -818,10 +924,9 @@ async function completePromisedValue(
       returnType,
       fieldGroup,
       path,
-      incrementalDataRecord,
+      incrementalContext,
     );
-    exeContext.incrementalPublisher.filter(path, incrementalDataRecord);
-    return null;
+    return [null, undefined];
   }
 }
 /**
@@ -857,7 +962,7 @@ function getStreamUsage(
   // safe to only check the first fieldNode for the stream directive
   const stream = getDirectiveValues(
     GraphQLStreamDirective,
-    fieldGroup.fields[0].node,
+    fieldGroup[0].node,
     exeContext.variableValues,
   );
   if (!stream) {
@@ -875,13 +980,10 @@ function getStreamUsage(
       false,
       '`@stream` directive not supported on subscription operations. Disable `@stream` by setting the `if` argument to `false`.',
     );
-  const streamedFieldGroup: FieldGroup = {
-    fields: fieldGroup.fields.map((fieldDetails) => ({
-      node: fieldDetails.node,
-      target: undefined,
-    })),
-    targets: NON_DEFERRED_TARGET_SET,
-  };
+  const streamedFieldGroup: FieldGroup = fieldGroup.map((fieldDetails) => ({
+    node: fieldDetails.node,
+    deferUsage: undefined,
+  }));
   const streamUsage = {
     initialCount: stream.initialCount,
     label: typeof stream.label === 'string' ? stream.label : undefined,
@@ -905,68 +1007,124 @@ async function completeAsyncIteratorValue(
   info: GraphQLResolveInfo,
   path: Path,
   asyncIterator: AsyncIterator<unknown>,
-  incrementalDataRecord: IncrementalDataRecord,
-  deferMap: ReadonlyMap<DeferUsage, DeferredFragmentRecord>,
-): Promise<ReadonlyArray<unknown>> {
-  const streamUsage = getStreamUsage(exeContext, fieldGroup, path);
+  incrementalContext: IncrementalContext | undefined,
+  deferMap: ReadonlyMap<DeferUsage, DeferredFragmentRecord> | undefined,
+): Promise<GraphQLWrappedResult<ReadonlyArray<unknown>>> {
   let containsPromise = false;
   const completedResults: Array<unknown> = [];
+  const graphqlWrappedResult: GraphQLWrappedResult<Array<unknown>> = [
+    completedResults,
+    undefined,
+  ];
   let index = 0;
-  // eslint-disable-next-line no-constant-condition
-  while (true) {
-    if (streamUsage && index >= streamUsage.initialCount) {
-      const earlyReturn = asyncIterator.return;
-      const streamRecord = new StreamRecord({
-        label: streamUsage.label,
-        path,
-        earlyReturn:
-          earlyReturn === undefined
-            ? undefined
-            : earlyReturn.bind(asyncIterator),
-      });
-      // eslint-disable-next-line @typescript-eslint/no-floating-promises
-      executeStreamAsyncIterator(
-        index,
-        asyncIterator,
-        exeContext,
-        streamUsage.fieldGroup,
-        info,
-        itemType,
-        path,
-        incrementalDataRecord,
-        streamRecord,
-      );
-      break;
-    }
-    const itemPath = addPath(path, index, undefined);
-    let iteration;
-    try {
-      // eslint-disable-next-line no-await-in-loop
-      iteration = await asyncIterator.next();
+  const streamUsage = getStreamUsage(exeContext, fieldGroup, path);
+  const earlyReturn =
+    asyncIterator.return === undefined
+      ? undefined
+      : asyncIterator.return.bind(asyncIterator);
+  try {
+    // eslint-disable-next-line no-constant-condition
+    while (true) {
+      if (streamUsage && index >= streamUsage.initialCount) {
+        const streamItemQueue = buildAsyncStreamItemQueue(
+          index,
+          path,
+          asyncIterator,
+          exeContext,
+          streamUsage.fieldGroup,
+          info,
+          itemType,
+        );
+        let streamRecord: StreamRecord | CancellableStreamRecord;
+        if (earlyReturn === undefined) {
+          streamRecord = {
+            label: streamUsage.label,
+            path,
+            streamItemQueue,
+          };
+        } else {
+          streamRecord = {
+            label: streamUsage.label,
+            path,
+            earlyReturn,
+            streamItemQueue,
+          };
+          if (exeContext.cancellableStreams === undefined) {
+            exeContext.cancellableStreams = new Set();
+          }
+          exeContext.cancellableStreams.add(streamRecord);
+        }
+        addIncrementalDataRecords(graphqlWrappedResult, [streamRecord]);
+        break;
+      }
+      const itemPath = addPath(path, index, undefined);
+      let iteration;
+      try {
+        // eslint-disable-next-line no-await-in-loop
+        iteration = await asyncIterator.next();
+      } catch (rawError) {
+        throw locatedError(rawError, toNodes(fieldGroup), pathToArray(path));
+      }
+      // TODO: add test case for stream returning done before initialCount
+      /* c8 ignore next 3 */
       if (iteration.done) {
         break;
       }
-    } catch (rawError) {
-      throw locatedError(rawError, toNodes(fieldGroup), pathToArray(path));
+      const item = iteration.value;
+      // TODO: add tests for stream backed by asyncIterator that returns a promise
+      /* c8 ignore start */
+      if (isPromise(item)) {
+        completedResults.push(
+          completePromisedListItemValue(
+            item,
+            graphqlWrappedResult,
+            exeContext,
+            itemType,
+            fieldGroup,
+            info,
+            itemPath,
+            incrementalContext,
+            deferMap,
+          ),
+        );
+        containsPromise = true;
+      } else if (
+        /* c8 ignore stop */
+        completeListItemValue(
+          item,
+          completedResults,
+          graphqlWrappedResult,
+          exeContext,
+          itemType,
+          fieldGroup,
+          info,
+          itemPath,
+          incrementalContext,
+          deferMap,
+        )
+        // TODO: add tests for stream backed by asyncIterator that completes to a promise
+        /* c8 ignore start */
+      ) {
+        containsPromise = true;
+      }
+      /* c8 ignore stop */
+      index++;
     }
-    if (
-      completeListItemValue(
-        iteration.value,
-        completedResults,
-        exeContext,
-        itemType,
-        fieldGroup,
-        info,
-        itemPath,
-        incrementalDataRecord,
-        deferMap,
-      )
-    ) {
-      containsPromise = true;
+  } catch (error) {
+    if (earlyReturn !== undefined) {
+      earlyReturn().catch(() => {
+        /* c8 ignore next 1 */
+        // ignore error
+      });
     }
-    index += 1;
+    throw error;
   }
-  return containsPromise ? Promise.all(completedResults) : completedResults;
+  return containsPromise
+    ? /* c8 ignore start */ Promise.all(completedResults).then((resolved) => [
+        resolved,
+        graphqlWrappedResult[1],
+      ])
+    : /* c8 ignore stop */ graphqlWrappedResult;
 }
 /**
  * Complete a list value by completing each item in the list with the
@@ -979,9 +1137,9 @@ function completeListValue(
   info: GraphQLResolveInfo,
   path: Path,
   result: unknown,
-  incrementalDataRecord: IncrementalDataRecord,
-  deferMap: ReadonlyMap<DeferUsage, DeferredFragmentRecord>,
-): PromiseOrValue<ReadonlyArray<unknown>> {
+  incrementalContext: IncrementalContext | undefined,
+  deferMap: ReadonlyMap<DeferUsage, DeferredFragmentRecord> | undefined,
+): PromiseOrValue<GraphQLWrappedResult<ReadonlyArray<unknown>>> {
   const itemType = returnType.ofType;
   if (isAsyncIterable(result)) {
     const asyncIterator = result[Symbol.asyncIterator]();
@@ -992,7 +1150,7 @@ function completeListValue(
       info,
       path,
       asyncIterator,
-      incrementalDataRecord,
+      incrementalContext,
       deferMap,
     );
   }
@@ -1001,59 +1159,102 @@ function completeListValue(
       `Expected Iterable, but did not find one for field "${info.parentType.name}.${info.fieldName}".`,
     );
   }
-  const streamUsage = getStreamUsage(exeContext, fieldGroup, path);
+  return completeIterableValue(
+    exeContext,
+    itemType,
+    fieldGroup,
+    info,
+    path,
+    result,
+    incrementalContext,
+    deferMap,
+  );
+}
+function completeIterableValue(
+  exeContext: ExecutionContext,
+  itemType: GraphQLOutputType,
+  fieldGroup: FieldGroup,
+  info: GraphQLResolveInfo,
+  path: Path,
+  items: Iterable<unknown>,
+  incrementalContext: IncrementalContext | undefined,
+  deferMap: ReadonlyMap<DeferUsage, DeferredFragmentRecord> | undefined,
+): PromiseOrValue<GraphQLWrappedResult<ReadonlyArray<unknown>>> {
   // This is specified as a simple map, however we're optimizing the path
   // where the list contains no Promises by avoiding creating another Promise.
   let containsPromise = false;
-  let currentParents = incrementalDataRecord;
   const completedResults: Array<unknown> = [];
+  const graphqlWrappedResult: GraphQLWrappedResult<Array<unknown>> = [
+    completedResults,
+    undefined,
+  ];
   let index = 0;
-  let streamRecord: StreamRecord | undefined;
-  for (const item of result) {
+  const streamUsage = getStreamUsage(exeContext, fieldGroup, path);
+  const iterator = items[Symbol.iterator]();
+  let iteration = iterator.next();
+  while (!iteration.done) {
+    const item = iteration.value;
+    if (streamUsage && index >= streamUsage.initialCount) {
+      const syncStreamRecord: StreamRecord = {
+        label: streamUsage.label,
+        path,
+        streamItemQueue: buildSyncStreamItemQueue(
+          item,
+          index,
+          path,
+          iterator,
+          exeContext,
+          streamUsage.fieldGroup,
+          info,
+          itemType,
+        ),
+      };
+      addIncrementalDataRecords(graphqlWrappedResult, [syncStreamRecord]);
+      break;
+    }
     // No need to modify the info object containing the path,
     // since from here on it is not ever accessed by resolver functions.
     const itemPath = addPath(path, index, undefined);
-    if (streamUsage && index >= streamUsage.initialCount) {
-      if (streamRecord === undefined) {
-        streamRecord = new StreamRecord({ label: streamUsage.label, path });
-      }
-      currentParents = executeStreamField(
-        path,
-        itemPath,
-        item,
-        exeContext,
-        streamUsage.fieldGroup,
-        info,
-        itemType,
-        currentParents,
-        streamRecord,
+    if (isPromise(item)) {
+      completedResults.push(
+        completePromisedListItemValue(
+          item,
+          graphqlWrappedResult,
+          exeContext,
+          itemType,
+          fieldGroup,
+          info,
+          itemPath,
+          incrementalContext,
+          deferMap,
+        ),
       );
-      index++;
-      continue;
-    }
-    if (
+      containsPromise = true;
+    } else if (
       completeListItemValue(
         item,
         completedResults,
+        graphqlWrappedResult,
         exeContext,
         itemType,
         fieldGroup,
         info,
         itemPath,
-        incrementalDataRecord,
+        incrementalContext,
         deferMap,
       )
     ) {
       containsPromise = true;
     }
     index++;
+    iteration = iterator.next();
   }
-  if (streamRecord !== undefined) {
-    exeContext.incrementalPublisher.setIsFinalRecord(
-      currentParents as StreamItemsRecord,
-    );
-  }
-  return containsPromise ? Promise.all(completedResults) : completedResults;
+  return containsPromise
+    ? Promise.all(completedResults).then((resolved) => [
+        resolved,
+        graphqlWrappedResult[1],
+      ])
+    : graphqlWrappedResult;
 }
 /**
  * Complete a list item value by adding it to the completed results.
@@ -1063,29 +1264,15 @@ function completeListValue(
 function completeListItemValue(
   item: unknown,
   completedResults: Array<unknown>,
+  parent: GraphQLWrappedResult<Array<unknown>>,
   exeContext: ExecutionContext,
   itemType: GraphQLOutputType,
   fieldGroup: FieldGroup,
   info: GraphQLResolveInfo,
   itemPath: Path,
-  incrementalDataRecord: IncrementalDataRecord,
-  deferMap: ReadonlyMap<DeferUsage, DeferredFragmentRecord>,
+  incrementalContext: IncrementalContext | undefined,
+  deferMap: ReadonlyMap<DeferUsage, DeferredFragmentRecord> | undefined,
 ): boolean {
-  if (isPromise(item)) {
-    completedResults.push(
-      completePromisedValue(
-        exeContext,
-        itemType,
-        fieldGroup,
-        info,
-        itemPath,
-        item,
-        incrementalDataRecord,
-        deferMap,
-      ),
-    );
-    return true;
-  }
   try {
     const completedItem = completeValue(
       exeContext,
@@ -1094,32 +1281,35 @@ function completeListItemValue(
       info,
       itemPath,
       item,
-      incrementalDataRecord,
+      incrementalContext,
       deferMap,
     );
     if (isPromise(completedItem)) {
       // Note: we don't rely on a `catch` method, but we do expect "thenable"
       // to take a second callback for the error case.
       completedResults.push(
-        completedItem.then(undefined, (rawError) => {
-          handleFieldError(
-            rawError,
-            exeContext,
-            itemType,
-            fieldGroup,
-            itemPath,
-            incrementalDataRecord,
-          );
-          exeContext.incrementalPublisher.filter(
-            itemPath,
-            incrementalDataRecord,
-          );
-          return null;
-        }),
+        completedItem.then(
+          (resolved) => {
+            addIncrementalDataRecords(parent, resolved[1]);
+            return resolved[0];
+          },
+          (rawError) => {
+            handleFieldError(
+              rawError,
+              exeContext,
+              itemType,
+              fieldGroup,
+              itemPath,
+              incrementalContext,
+            );
+            return null;
+          },
+        ),
       );
       return true;
     }
-    completedResults.push(completedItem);
+    completedResults.push(completedItem[0]);
+    addIncrementalDataRecords(parent, completedItem[1]);
   } catch (rawError) {
     handleFieldError(
       rawError,
@@ -1127,12 +1317,51 @@ function completeListItemValue(
       itemType,
       fieldGroup,
       itemPath,
-      incrementalDataRecord,
+      incrementalContext,
     );
-    exeContext.incrementalPublisher.filter(itemPath, incrementalDataRecord);
     completedResults.push(null);
   }
   return false;
+}
+async function completePromisedListItemValue(
+  item: unknown,
+  parent: GraphQLWrappedResult<Array<unknown>>,
+  exeContext: ExecutionContext,
+  itemType: GraphQLOutputType,
+  fieldGroup: FieldGroup,
+  info: GraphQLResolveInfo,
+  itemPath: Path,
+  incrementalContext: IncrementalContext | undefined,
+  deferMap: ReadonlyMap<DeferUsage, DeferredFragmentRecord> | undefined,
+): Promise<unknown> {
+  try {
+    const resolved = await item;
+    let completed = completeValue(
+      exeContext,
+      itemType,
+      fieldGroup,
+      info,
+      itemPath,
+      resolved,
+      incrementalContext,
+      deferMap,
+    );
+    if (isPromise(completed)) {
+      completed = await completed;
+    }
+    addIncrementalDataRecords(parent, completed[1]);
+    return completed[0];
+  } catch (rawError) {
+    handleFieldError(
+      rawError,
+      exeContext,
+      itemType,
+      fieldGroup,
+      itemPath,
+      incrementalContext,
+    );
+    return null;
+  }
 }
 /**
  * Complete a Scalar or Enum by serializing to a valid value, returning
@@ -1162,9 +1391,9 @@ function completeAbstractValue(
   info: GraphQLResolveInfo,
   path: Path,
   result: unknown,
-  incrementalDataRecord: IncrementalDataRecord,
-  deferMap: ReadonlyMap<DeferUsage, DeferredFragmentRecord>,
-): PromiseOrValue<ObjMap<unknown>> {
+  incrementalContext: IncrementalContext | undefined,
+  deferMap: ReadonlyMap<DeferUsage, DeferredFragmentRecord> | undefined,
+): PromiseOrValue<GraphQLWrappedResult<ObjMap<unknown>>> {
   const resolveTypeFn = returnType.resolveType ?? exeContext.typeResolver;
   const contextValue = exeContext.contextValue;
   const runtimeType = resolveTypeFn(result, contextValue, info, returnType);
@@ -1184,7 +1413,7 @@ function completeAbstractValue(
         info,
         path,
         result,
-        incrementalDataRecord,
+        incrementalContext,
         deferMap,
       ),
     );
@@ -1203,7 +1432,7 @@ function completeAbstractValue(
     info,
     path,
     result,
-    incrementalDataRecord,
+    incrementalContext,
     deferMap,
   );
 }
@@ -1265,9 +1494,9 @@ function completeObjectValue(
   info: GraphQLResolveInfo,
   path: Path,
   result: unknown,
-  incrementalDataRecord: IncrementalDataRecord,
-  deferMap: ReadonlyMap<DeferUsage, DeferredFragmentRecord>,
-): PromiseOrValue<ObjMap<unknown>> {
+  incrementalContext: IncrementalContext | undefined,
+  deferMap: ReadonlyMap<DeferUsage, DeferredFragmentRecord> | undefined,
+): PromiseOrValue<GraphQLWrappedResult<ObjMap<unknown>>> {
   // If there is an isTypeOf predicate function, call it with the
   // current result. If isTypeOf returns false, then raise an error rather
   // than continuing execution.
@@ -1284,7 +1513,7 @@ function completeObjectValue(
           fieldGroup,
           path,
           result,
-          incrementalDataRecord,
+          incrementalContext,
           deferMap,
         );
       });
@@ -1299,7 +1528,7 @@ function completeObjectValue(
     fieldGroup,
     path,
     result,
-    incrementalDataRecord,
+    incrementalContext,
     deferMap,
   );
 }
@@ -1331,42 +1560,21 @@ function invalidReturnTypeError(
  *
  */
 function addNewDeferredFragments(
-  incrementalPublisher: IncrementalPublisher,
   newDeferUsages: ReadonlyArray<DeferUsage>,
-  incrementalDataRecord: IncrementalDataRecord,
-  deferMap?: ReadonlyMap<DeferUsage, DeferredFragmentRecord>,
+  newDeferMap: Map<DeferUsage, DeferredFragmentRecord>,
   path?: Path | undefined,
 ): ReadonlyMap<DeferUsage, DeferredFragmentRecord> {
-  if (newDeferUsages.length === 0) {
-    // Given no DeferUsages, return the existing map, creating one if necessary.
-    return deferMap ?? new Map<DeferUsage, DeferredFragmentRecord>();
-  }
-  // Create a copy of the old map.
-  const newDeferMap =
-    deferMap === undefined
-      ? new Map<DeferUsage, DeferredFragmentRecord>()
-      : new Map<DeferUsage, DeferredFragmentRecord>(deferMap);
   // For each new deferUsage object:
   for (const newDeferUsage of newDeferUsages) {
-    // DeferUsage objects track their parent targets; the immediate parent is always the first member of this list.
-    const parentTarget = newDeferUsage.ancestors[0];
-    // If the parent target is defined, the parent target is a DeferUsage object and
-    // the parent result record is the DeferredFragmentRecord corresponding to that DeferUsage.
-    // If the parent target is not defined, the parent result record is either:
-    //  - the InitialResultRecord, or
-    //  - a StreamItemsRecord, as `@defer` may be nested under `@stream`.
+    const parentDeferUsage = newDeferUsage.parentDeferUsage;
     const parent =
-      parentTarget === undefined
-        ? (incrementalDataRecord as InitialResultRecord | StreamItemsRecord)
-        : deferredFragmentRecordFromDeferUsage(parentTarget, newDeferMap);
+      parentDeferUsage === undefined
+        ? undefined
+        : deferredFragmentRecordFromDeferUsage(parentDeferUsage, newDeferMap);
     // Instantiate the new record.
-    const deferredFragmentRecord = new DeferredFragmentRecord({
+    const deferredFragmentRecord = new DeferredFragmentRecord(
       path,
-      label: newDeferUsage.label,
-    });
-    // Report the new record to the Incremental Publisher.
-    incrementalPublisher.reportNewDeferFragmentRecord(
-      deferredFragmentRecord,
+      newDeferUsage.label,
       parent,
     );
     // Update the map.
@@ -1381,67 +1589,43 @@ function deferredFragmentRecordFromDeferUsage(
   // eslint-disable-next-line @typescript-eslint/no-non-null-assertion
   return deferMap.get(deferUsage)!;
 }
-function addNewDeferredGroupedFieldSets(
-  incrementalPublisher: IncrementalPublisher,
-  newGroupedFieldSetDetails: Map<DeferUsageSet, GroupedFieldSetDetails>,
-  deferMap: ReadonlyMap<DeferUsage, DeferredFragmentRecord>,
-  path?: Path | undefined,
-): ReadonlyArray<DeferredGroupedFieldSetRecord> {
-  const newDeferredGroupedFieldSetRecords: Array<DeferredGroupedFieldSetRecord> =
-    [];
-  for (const [
-    newGroupedFieldSetDeferUsages,
-    { groupedFieldSet, shouldInitiateDefer },
-  ] of newGroupedFieldSetDetails) {
-    const deferredFragmentRecords = getDeferredFragmentRecords(
-      newGroupedFieldSetDeferUsages,
-      deferMap,
-    );
-    const deferredGroupedFieldSetRecord = new DeferredGroupedFieldSetRecord({
-      path,
-      deferredFragmentRecords,
-      groupedFieldSet,
-      shouldInitiateDefer,
-    });
-    incrementalPublisher.reportNewDeferredGroupedFieldSetRecord(
-      deferredGroupedFieldSetRecord,
-    );
-    newDeferredGroupedFieldSetRecords.push(deferredGroupedFieldSetRecord);
-  }
-  return newDeferredGroupedFieldSetRecords;
-}
-function getDeferredFragmentRecords(
-  deferUsages: DeferUsageSet,
-  deferMap: ReadonlyMap<DeferUsage, DeferredFragmentRecord>,
-): ReadonlyArray<DeferredFragmentRecord> {
-  return Array.from(deferUsages).map((deferUsage) =>
-    deferredFragmentRecordFromDeferUsage(deferUsage, deferMap),
-  );
-}
 function collectAndExecuteSubfields(
   exeContext: ExecutionContext,
   returnType: GraphQLObjectType,
   fieldGroup: FieldGroup,
   path: Path,
   result: unknown,
-  incrementalDataRecord: IncrementalDataRecord,
-  deferMap: ReadonlyMap<DeferUsage, DeferredFragmentRecord>,
-): PromiseOrValue<ObjMap<unknown>> {
+  incrementalContext: IncrementalContext | undefined,
+  deferMap: ReadonlyMap<DeferUsage, DeferredFragmentRecord> | undefined,
+): PromiseOrValue<GraphQLWrappedResult<ObjMap<unknown>>> {
   // Collect sub-fields to execute to complete this value.
-  const { groupedFieldSet, newGroupedFieldSetDetails, newDeferUsages } =
-    collectSubfields(exeContext, returnType, fieldGroup);
-  const incrementalPublisher = exeContext.incrementalPublisher;
-  const newDeferMap = addNewDeferredFragments(
-    incrementalPublisher,
-    newDeferUsages,
-    incrementalDataRecord,
-    deferMap,
-    path,
+  const collectedSubfields = collectSubfields(
+    exeContext,
+    returnType,
+    fieldGroup,
   );
-  const newDeferredGroupedFieldSetRecords = addNewDeferredGroupedFieldSets(
-    incrementalPublisher,
-    newGroupedFieldSetDetails,
-    newDeferMap,
+  let groupedFieldSet = collectedSubfields.groupedFieldSet;
+  const newDeferUsages = collectedSubfields.newDeferUsages;
+  if (deferMap === undefined && newDeferUsages.length === 0) {
+    return executeFields(
+      exeContext,
+      returnType,
+      result,
+      path,
+      groupedFieldSet,
+      incrementalContext,
+      undefined,
+    );
+  }
+  const subExecutionPlan = buildSubExecutionPlan(
+    groupedFieldSet,
+    incrementalContext?.deferUsageSet,
+  );
+  groupedFieldSet = subExecutionPlan.groupedFieldSet;
+  const newGroupedFieldSets = subExecutionPlan.newGroupedFieldSets;
+  const newDeferMap = addNewDeferredFragments(
+    newDeferUsages,
+    new Map(deferMap),
     path,
   );
   const subFields = executeFields(
@@ -1450,18 +1634,42 @@ function collectAndExecuteSubfields(
     result,
     path,
     groupedFieldSet,
-    incrementalDataRecord,
+    incrementalContext,
     newDeferMap,
   );
-  executeDeferredGroupedFieldSets(
-    exeContext,
-    returnType,
-    result,
-    path,
-    newDeferredGroupedFieldSetRecords,
-    newDeferMap,
-  );
+  if (newGroupedFieldSets.size > 0) {
+    const newPendingExecutionGroups = collectExecutionGroups(
+      exeContext,
+      returnType,
+      result,
+      path,
+      incrementalContext?.deferUsageSet,
+      newGroupedFieldSets,
+      newDeferMap,
+    );
+    return withNewExecutionGroups(subFields, newPendingExecutionGroups);
+  }
   return subFields;
+}
+function buildSubExecutionPlan(
+  originalGroupedFieldSet: GroupedFieldSet,
+  deferUsageSet: DeferUsageSet | undefined,
+): ExecutionPlan {
+  let executionPlan = (
+    originalGroupedFieldSet as unknown as {
+      _executionPlan: ExecutionPlan;
+    }
+  )._executionPlan;
+  if (executionPlan !== undefined) {
+    return executionPlan;
+  }
+  executionPlan = buildExecutionPlan(originalGroupedFieldSet, deferUsageSet);
+  (
+    originalGroupedFieldSet as unknown as {
+      _executionPlan: ExecutionPlan;
+    }
+  )._executionPlan = executionPlan;
+  return executionPlan;
 }
 /**
  * If a resolveType function is not given, then a default resolve behavior is
@@ -1587,7 +1795,7 @@ function mapSourceToResponse(
   return mapAsyncIterable(
     resultOrStream,
     (payload: unknown) =>
-      executeImpl(
+      executeOperation(
         buildPerEventExecutionContext(exeContext, payload),
       ) as ExecutionResult,
   );
@@ -1669,19 +1877,20 @@ function executeSubscription(
     FieldGroup,
   ];
   const [responseName, fieldGroup] = firstRootField;
-  const fieldName = fieldGroup.fields[0].node.name.value;
+  const fieldName = fieldGroup[0].node.name.value;
   const fieldDef = schema.getField(rootType, fieldName);
+  const fieldNodes = fieldGroup.map((fieldDetails) => fieldDetails.node);
   if (!fieldDef) {
     throw new GraphQLError(
       `The subscription field "${fieldName}" is not defined.`,
-      { nodes: toNodes(fieldGroup) },
+      { nodes: fieldNodes },
     );
   }
   const path = addPath(undefined, responseName, rootType.name);
   const info = buildResolveInfo(
     exeContext,
     fieldDef,
-    fieldGroup,
+    fieldNodes,
     rootType,
     path,
   );
@@ -1690,11 +1899,7 @@ function executeSubscription(
     // It differs from "ResolveFieldValue" due to providing a different `resolveFn`.
     // Build a JS object of arguments from the field.arguments AST, using the
     // variables scope to fulfill any variable references.
-    const args = getArgumentValues(
-      fieldDef,
-      fieldGroup.fields[0].node,
-      variableValues,
-    );
+    const args = getArgumentValues(fieldDef, fieldNodes[0], variableValues);
     // The resolve function's optional third argument is a context value that
     // is provided to every resolve function within an execution. It is commonly
     // used to represent an authenticated user, or request-specific caches.
@@ -1705,12 +1910,12 @@ function executeSubscription(
     const result = resolveFn(rootValue, args, contextValue, info);
     if (isPromise(result)) {
       return result.then(assertEventStream).then(undefined, (error) => {
-        throw locatedError(error, toNodes(fieldGroup), pathToArray(path));
+        throw locatedError(error, fieldNodes, pathToArray(path));
       });
     }
     return assertEventStream(result);
   } catch (error) {
-    throw locatedError(error, toNodes(fieldGroup), pathToArray(path));
+    throw locatedError(error, fieldNodes, pathToArray(path));
   }
 }
 function assertEventStream(result: unknown): AsyncIterable<unknown> {
@@ -1726,139 +1931,326 @@ function assertEventStream(result: unknown): AsyncIterable<unknown> {
   }
   return result;
 }
-function executeDeferredGroupedFieldSets(
+function collectExecutionGroups(
   exeContext: ExecutionContext,
   parentType: GraphQLObjectType,
   sourceValue: unknown,
   path: Path | undefined,
-  newDeferredGroupedFieldSetRecords: ReadonlyArray<DeferredGroupedFieldSetRecord>,
+  parentDeferUsages: DeferUsageSet | undefined,
+  newGroupedFieldSets: Map<DeferUsageSet, GroupedFieldSet>,
   deferMap: ReadonlyMap<DeferUsage, DeferredFragmentRecord>,
-): void {
-  for (const deferredGroupedFieldSetRecord of newDeferredGroupedFieldSetRecords) {
-    if (deferredGroupedFieldSetRecord.shouldInitiateDefer) {
-      // eslint-disable-next-line @typescript-eslint/no-floating-promises
-      Promise.resolve().then(() =>
-        executeDeferredGroupedFieldSet(
-          exeContext,
-          parentType,
-          sourceValue,
-          path,
-          deferredGroupedFieldSetRecord,
-          deferMap,
-        ),
-      );
-      continue;
-    }
-    executeDeferredGroupedFieldSet(
-      exeContext,
-      parentType,
-      sourceValue,
-      path,
-      deferredGroupedFieldSetRecord,
+): ReadonlyArray<PendingExecutionGroup> {
+  const newPendingExecutionGroups: Array<PendingExecutionGroup> = [];
+  for (const [deferUsageSet, groupedFieldSet] of newGroupedFieldSets) {
+    const deferredFragmentRecords = getDeferredFragmentRecords(
+      deferUsageSet,
       deferMap,
     );
+    const pendingExecutionGroup: PendingExecutionGroup = {
+      deferredFragmentRecords,
+      result:
+        undefined as unknown as BoxedPromiseOrValue<CompletedExecutionGroup>,
+    };
+    const executor = () =>
+      executeExecutionGroup(
+        pendingExecutionGroup,
+        exeContext,
+        parentType,
+        sourceValue,
+        path,
+        groupedFieldSet,
+        {
+          errors: undefined,
+          deferUsageSet,
+        },
+        deferMap,
+      );
+    if (exeContext.enableEarlyExecution) {
+      pendingExecutionGroup.result = new BoxedPromiseOrValue(
+        shouldDefer(parentDeferUsages, deferUsageSet)
+          ? Promise.resolve().then(executor)
+          : executor(),
+      );
+    } else {
+      pendingExecutionGroup.result = () => new BoxedPromiseOrValue(executor());
+    }
+    newPendingExecutionGroups.push(pendingExecutionGroup);
   }
+  return newPendingExecutionGroups;
 }
-function executeDeferredGroupedFieldSet(
+function shouldDefer(
+  parentDeferUsages: undefined | DeferUsageSet,
+  deferUsages: DeferUsageSet,
+): boolean {
+  // If we have a new child defer usage, defer.
+  // Otherwise, this defer usage was already deferred when it was initially
+  // encountered, and is now in the midst of executing early, so the new
+  // deferred grouped fields set can be executed immediately.
+  return (
+    parentDeferUsages === undefined ||
+    !Array.from(deferUsages).every((deferUsage) =>
+      parentDeferUsages.has(deferUsage),
+    )
+  );
+}
+function executeExecutionGroup(
+  pendingExecutionGroup: PendingExecutionGroup,
   exeContext: ExecutionContext,
   parentType: GraphQLObjectType,
   sourceValue: unknown,
   path: Path | undefined,
-  deferredGroupedFieldSetRecord: DeferredGroupedFieldSetRecord,
+  groupedFieldSet: GroupedFieldSet,
+  incrementalContext: IncrementalContext,
   deferMap: ReadonlyMap<DeferUsage, DeferredFragmentRecord>,
-): void {
+): PromiseOrValue<CompletedExecutionGroup> {
+  let result;
   try {
-    const incrementalResult = executeFields(
+    result = executeFields(
       exeContext,
       parentType,
       sourceValue,
       path,
-      deferredGroupedFieldSetRecord.groupedFieldSet,
-      deferredGroupedFieldSetRecord,
+      groupedFieldSet,
+      incrementalContext,
       deferMap,
-    );
-    if (isPromise(incrementalResult)) {
-      incrementalResult.then(
-        (resolved) =>
-          exeContext.incrementalPublisher.completeDeferredGroupedFieldSet(
-            deferredGroupedFieldSetRecord,
-            resolved,
-          ),
-        (error) =>
-          exeContext.incrementalPublisher.markErroredDeferredGroupedFieldSet(
-            deferredGroupedFieldSetRecord,
-            error,
-          ),
-      );
-      return;
-    }
-    exeContext.incrementalPublisher.completeDeferredGroupedFieldSet(
-      deferredGroupedFieldSetRecord,
-      incrementalResult,
     );
   } catch (error) {
-    exeContext.incrementalPublisher.markErroredDeferredGroupedFieldSet(
-      deferredGroupedFieldSetRecord,
-      error,
+    return {
+      pendingExecutionGroup,
+      path: pathToArray(path),
+      errors: withError(incrementalContext.errors, error),
+    };
+  }
+  if (isPromise(result)) {
+    return result.then(
+      (resolved) =>
+        buildCompletedExecutionGroup(
+          incrementalContext.errors,
+          pendingExecutionGroup,
+          path,
+          resolved,
+        ),
+      (error) => ({
+        pendingExecutionGroup,
+        path: pathToArray(path),
+        errors: withError(incrementalContext.errors, error),
+      }),
     );
   }
+  return buildCompletedExecutionGroup(
+    incrementalContext.errors,
+    pendingExecutionGroup,
+    path,
+    result,
+  );
 }
-function executeStreamField(
-  path: Path,
-  itemPath: Path,
-  item: PromiseOrValue<unknown>,
+function buildCompletedExecutionGroup(
+  errors: ReadonlyArray<GraphQLError> | undefined,
+  pendingExecutionGroup: PendingExecutionGroup,
+  path: Path | undefined,
+  result: GraphQLWrappedResult<ObjMap<unknown>>,
+): CompletedExecutionGroup {
+  return {
+    pendingExecutionGroup,
+    path: pathToArray(path),
+    result:
+      errors === undefined ? { data: result[0] } : { data: result[0], errors },
+    incrementalDataRecords: result[1],
+  };
+}
+function getDeferredFragmentRecords(
+  deferUsages: DeferUsageSet,
+  deferMap: ReadonlyMap<DeferUsage, DeferredFragmentRecord>,
+): ReadonlyArray<DeferredFragmentRecord> {
+  return Array.from(deferUsages).map((deferUsage) =>
+    deferredFragmentRecordFromDeferUsage(deferUsage, deferMap),
+  );
+}
+function buildSyncStreamItemQueue(
+  initialItem: PromiseOrValue<unknown>,
+  initialIndex: number,
+  streamPath: Path,
+  iterator: Iterator<unknown>,
   exeContext: ExecutionContext,
   fieldGroup: FieldGroup,
   info: GraphQLResolveInfo,
   itemType: GraphQLOutputType,
-  incrementalDataRecord: IncrementalDataRecord,
-  streamRecord: StreamRecord,
-): StreamItemsRecord {
-  const incrementalPublisher = exeContext.incrementalPublisher;
-  const streamItemsRecord = new StreamItemsRecord({
-    streamRecord,
-    path: itemPath,
-  });
-  incrementalPublisher.reportNewStreamItemsRecord(
-    streamItemsRecord,
-    incrementalDataRecord,
+): Array<StreamItemRecord> {
+  const streamItemQueue: Array<StreamItemRecord> = [];
+  const enableEarlyExecution = exeContext.enableEarlyExecution;
+  const firstExecutor = () => {
+    const initialPath = addPath(streamPath, initialIndex, undefined);
+    const firstStreamItem = new BoxedPromiseOrValue(
+      completeStreamItem(
+        initialPath,
+        initialItem,
+        exeContext,
+        { errors: undefined },
+        fieldGroup,
+        info,
+        itemType,
+      ),
+    );
+    let iteration = iterator.next();
+    let currentIndex = initialIndex + 1;
+    let currentStreamItem:
+      | BoxedPromiseOrValue<StreamItemResult>
+      | (() => BoxedPromiseOrValue<StreamItemResult>) = firstStreamItem;
+    while (!iteration.done) {
+      // TODO: add test case for early sync termination
+      /* c8 ignore next 6 */
+      if (currentStreamItem instanceof BoxedPromiseOrValue) {
+        const result = currentStreamItem.value;
+        if (!isPromise(result) && result.errors !== undefined) {
+          break;
+        }
+      }
+      const itemPath = addPath(streamPath, currentIndex, undefined);
+      const value = iteration.value;
+      const currentExecutor = () =>
+        completeStreamItem(
+          itemPath,
+          value,
+          exeContext,
+          { errors: undefined },
+          fieldGroup,
+          info,
+          itemType,
+        );
+      currentStreamItem = enableEarlyExecution
+        ? new BoxedPromiseOrValue(currentExecutor())
+        : () => new BoxedPromiseOrValue(currentExecutor());
+      streamItemQueue.push(currentStreamItem);
+      iteration = iterator.next();
+      currentIndex = initialIndex + 1;
+    }
+    streamItemQueue.push(new BoxedPromiseOrValue({}));
+    return firstStreamItem.value;
+  };
+  streamItemQueue.push(
+    enableEarlyExecution
+      ? new BoxedPromiseOrValue(Promise.resolve().then(firstExecutor))
+      : () => new BoxedPromiseOrValue(firstExecutor()),
   );
+  return streamItemQueue;
+}
+function buildAsyncStreamItemQueue(
+  initialIndex: number,
+  streamPath: Path,
+  asyncIterator: AsyncIterator<unknown>,
+  exeContext: ExecutionContext,
+  fieldGroup: FieldGroup,
+  info: GraphQLResolveInfo,
+  itemType: GraphQLOutputType,
+): Array<StreamItemRecord> {
+  const streamItemQueue: Array<StreamItemRecord> = [];
+  const executor = () =>
+    getNextAsyncStreamItemResult(
+      streamItemQueue,
+      streamPath,
+      initialIndex,
+      asyncIterator,
+      exeContext,
+      fieldGroup,
+      info,
+      itemType,
+    );
+  streamItemQueue.push(
+    exeContext.enableEarlyExecution
+      ? new BoxedPromiseOrValue(executor())
+      : () => new BoxedPromiseOrValue(executor()),
+  );
+  return streamItemQueue;
+}
+async function getNextAsyncStreamItemResult(
+  streamItemQueue: Array<StreamItemRecord>,
+  streamPath: Path,
+  index: number,
+  asyncIterator: AsyncIterator<unknown>,
+  exeContext: ExecutionContext,
+  fieldGroup: FieldGroup,
+  info: GraphQLResolveInfo,
+  itemType: GraphQLOutputType,
+): Promise<StreamItemResult> {
+  let iteration;
+  try {
+    iteration = await asyncIterator.next();
+  } catch (error) {
+    return {
+      errors: [
+        locatedError(error, toNodes(fieldGroup), pathToArray(streamPath)),
+      ],
+    };
+  }
+  if (iteration.done) {
+    return {};
+  }
+  const itemPath = addPath(streamPath, index, undefined);
+  const result = completeStreamItem(
+    itemPath,
+    iteration.value,
+    exeContext,
+    { errors: undefined },
+    fieldGroup,
+    info,
+    itemType,
+  );
+  const executor = () =>
+    getNextAsyncStreamItemResult(
+      streamItemQueue,
+      streamPath,
+      index,
+      asyncIterator,
+      exeContext,
+      fieldGroup,
+      info,
+      itemType,
+    );
+  streamItemQueue.push(
+    exeContext.enableEarlyExecution
+      ? new BoxedPromiseOrValue(executor())
+      : () => new BoxedPromiseOrValue(executor()),
+  );
+  return result;
+}
+function completeStreamItem(
+  itemPath: Path,
+  item: unknown,
+  exeContext: ExecutionContext,
+  incrementalContext: IncrementalContext,
+  fieldGroup: FieldGroup,
+  info: GraphQLResolveInfo,
+  itemType: GraphQLOutputType,
+): PromiseOrValue<StreamItemResult> {
   if (isPromise(item)) {
-    completePromisedValue(
+    return completePromisedValue(
       exeContext,
       itemType,
       fieldGroup,
       info,
       itemPath,
       item,
-      streamItemsRecord,
+      incrementalContext,
       new Map(),
     ).then(
-      (value) =>
-        incrementalPublisher.completeStreamItemsRecord(streamItemsRecord, [
-          value,
-        ]),
-      (error) => {
-        incrementalPublisher.filter(path, streamItemsRecord);
-        incrementalPublisher.markErroredStreamItemsRecord(
-          streamItemsRecord,
-          error,
-        );
-      },
+      (resolvedItem) =>
+        buildStreamItemResult(incrementalContext.errors, resolvedItem),
+      (error) => ({
+        errors: withError(incrementalContext.errors, error),
+      }),
     );
-    return streamItemsRecord;
   }
-  let completedItem: PromiseOrValue<unknown>;
+  let result: PromiseOrValue<GraphQLWrappedResult<unknown>>;
   try {
     try {
-      completedItem = completeValue(
+      result = completeValue(
         exeContext,
         itemType,
         fieldGroup,
         info,
         itemPath,
         item,
-        streamItemsRecord,
+        incrementalContext,
         new Map(),
       );
     } catch (rawError) {
@@ -1868,18 +2260,17 @@ function executeStreamField(
         itemType,
         fieldGroup,
         itemPath,
-        streamItemsRecord,
+        incrementalContext,
       );
-      completedItem = null;
-      incrementalPublisher.filter(itemPath, streamItemsRecord);
+      result = [null, undefined];
     }
   } catch (error) {
-    incrementalPublisher.filter(path, streamItemsRecord);
-    incrementalPublisher.markErroredStreamItemsRecord(streamItemsRecord, error);
-    return streamItemsRecord;
+    return {
+      errors: withError(incrementalContext.errors, error),
+    };
   }
-  if (isPromise(completedItem)) {
-    completedItem
+  if (isPromise(result)) {
+    return result
       .then(undefined, (rawError) => {
         handleFieldError(
           rawError,
@@ -1887,169 +2278,27 @@ function executeStreamField(
           itemType,
           fieldGroup,
           itemPath,
-          streamItemsRecord,
+          incrementalContext,
         );
-        incrementalPublisher.filter(itemPath, streamItemsRecord);
-        return null;
+        return [null, undefined] as GraphQLWrappedResult<unknown>;
       })
       .then(
-        (value) =>
-          incrementalPublisher.completeStreamItemsRecord(streamItemsRecord, [
-            value,
-          ]),
-        (error) => {
-          incrementalPublisher.filter(path, streamItemsRecord);
-          incrementalPublisher.markErroredStreamItemsRecord(
-            streamItemsRecord,
-            error,
-          );
-        },
+        (resolvedItem) =>
+          buildStreamItemResult(incrementalContext.errors, resolvedItem),
+        (error) => ({
+          errors: withError(incrementalContext.errors, error),
+        }),
       );
-    return streamItemsRecord;
   }
-  incrementalPublisher.completeStreamItemsRecord(streamItemsRecord, [
-    completedItem,
-  ]);
-  return streamItemsRecord;
+  return buildStreamItemResult(incrementalContext.errors, result);
 }
-async function executeStreamAsyncIteratorItem(
-  asyncIterator: AsyncIterator<unknown>,
-  exeContext: ExecutionContext,
-  fieldGroup: FieldGroup,
-  info: GraphQLResolveInfo,
-  itemType: GraphQLOutputType,
-  streamItemsRecord: StreamItemsRecord,
-  itemPath: Path,
-): Promise<IteratorResult<unknown>> {
-  let item;
-  try {
-    const iteration = await asyncIterator.next();
-    if (streamItemsRecord.streamRecord.errors.length > 0) {
-      return { done: true, value: undefined };
-    }
-    if (iteration.done) {
-      exeContext.incrementalPublisher.setIsCompletedAsyncIterator(
-        streamItemsRecord,
-      );
-      return { done: true, value: undefined };
-    }
-    item = iteration.value;
-  } catch (rawError) {
-    throw locatedError(
-      rawError,
-      toNodes(fieldGroup),
-      streamItemsRecord.streamRecord.path,
-    );
-  }
-  let completedItem;
-  try {
-    completedItem = completeValue(
-      exeContext,
-      itemType,
-      fieldGroup,
-      info,
-      itemPath,
-      item,
-      streamItemsRecord,
-      new Map(),
-    );
-    if (isPromise(completedItem)) {
-      completedItem = completedItem.then(undefined, (rawError) => {
-        handleFieldError(
-          rawError,
-          exeContext,
-          itemType,
-          fieldGroup,
-          itemPath,
-          streamItemsRecord,
-        );
-        exeContext.incrementalPublisher.filter(itemPath, streamItemsRecord);
-        return null;
-      });
-    }
-    return { done: false, value: completedItem };
-  } catch (rawError) {
-    handleFieldError(
-      rawError,
-      exeContext,
-      itemType,
-      fieldGroup,
-      itemPath,
-      streamItemsRecord,
-    );
-    exeContext.incrementalPublisher.filter(itemPath, streamItemsRecord);
-    return { done: false, value: null };
-  }
-}
-async function executeStreamAsyncIterator(
-  initialIndex: number,
-  asyncIterator: AsyncIterator<unknown>,
-  exeContext: ExecutionContext,
-  fieldGroup: FieldGroup,
-  info: GraphQLResolveInfo,
-  itemType: GraphQLOutputType,
-  path: Path,
-  incrementalDataRecord: IncrementalDataRecord,
-  streamRecord: StreamRecord,
-): Promise<void> {
-  const incrementalPublisher = exeContext.incrementalPublisher;
-  let index = initialIndex;
-  let currentIncrementalDataRecord = incrementalDataRecord;
-  // eslint-disable-next-line no-constant-condition
-  while (true) {
-    const itemPath = addPath(path, index, undefined);
-    const streamItemsRecord = new StreamItemsRecord({
-      streamRecord,
-      path: itemPath,
-    });
-    incrementalPublisher.reportNewStreamItemsRecord(
-      streamItemsRecord,
-      currentIncrementalDataRecord,
-    );
-    let iteration;
-    try {
-      // eslint-disable-next-line no-await-in-loop
-      iteration = await executeStreamAsyncIteratorItem(
-        asyncIterator,
-        exeContext,
-        fieldGroup,
-        info,
-        itemType,
-        streamItemsRecord,
-        itemPath,
-      );
-    } catch (error) {
-      incrementalPublisher.filter(path, streamItemsRecord);
-      incrementalPublisher.markErroredStreamItemsRecord(
-        streamItemsRecord,
-        error,
-      );
-      return;
-    }
-    const { done, value: completedItem } = iteration;
-    if (isPromise(completedItem)) {
-      completedItem.then(
-        (value) =>
-          incrementalPublisher.completeStreamItemsRecord(streamItemsRecord, [
-            value,
-          ]),
-        (error) => {
-          incrementalPublisher.filter(path, streamItemsRecord);
-          incrementalPublisher.markErroredStreamItemsRecord(
-            streamItemsRecord,
-            error,
-          );
-        },
-      );
-    } else {
-      incrementalPublisher.completeStreamItemsRecord(streamItemsRecord, [
-        completedItem,
-      ]);
-    }
-    if (done) {
-      break;
-    }
-    currentIncrementalDataRecord = streamItemsRecord;
-    index++;
-  }
+function buildStreamItemResult(
+  errors: ReadonlyArray<GraphQLError> | undefined,
+  result: GraphQLWrappedResult<unknown>,
+): StreamItemResult {
+  return {
+    item: result[0],
+    errors,
+    incrementalDataRecords: result[1],
+  };
 }

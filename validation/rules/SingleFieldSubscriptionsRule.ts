@@ -11,7 +11,7 @@ import type { FieldGroup } from '../../execution/collectFields.ts';
 import { collectFields } from '../../execution/collectFields.ts';
 import type { ValidationContext } from '../ValidationContext.ts';
 function toNodes(fieldGroup: FieldGroup): ReadonlyArray<FieldNode> {
-  return fieldGroup.fields.map((fieldDetails) => fieldDetails.node);
+  return fieldGroup.map((fieldDetails) => fieldDetails.node);
 }
 /**
  * Subscriptions must only include a non-introspection field.
