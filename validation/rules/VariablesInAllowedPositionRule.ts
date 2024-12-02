@@ -1,11 +1,17 @@
-import { inspect } from '../../jsutils/inspect.ts';
 import type { Maybe } from '../../jsutils/Maybe.ts';
 import { GraphQLError } from '../../error/GraphQLError.ts';
 import type { ValueNode, VariableDefinitionNode } from '../../language/ast.ts';
 import { Kind } from '../../language/kinds.ts';
 import type { ASTVisitor } from '../../language/visitor.ts';
-import type { GraphQLType } from '../../type/definition.ts';
-import { isNonNullType } from '../../type/definition.ts';
+import type {
+  GraphQLDefaultValueUsage,
+  GraphQLType,
+} from '../../type/definition.ts';
+import {
+  isInputObjectType,
+  isNonNullType,
+  isNullableType,
+} from '../../type/definition.ts';
 import type { GraphQLSchema } from '../../type/schema.ts';
 import { isTypeSubTypeOf } from '../../utilities/typeComparators.ts';
 import { typeFromAST } from '../../utilities/typeFromAST.ts';
@@ -28,9 +34,18 @@ export function VariablesInAllowedPositionRule(
       },
       leave(operation) {
         const usages = context.getRecursiveVariableUsages(operation);
-        for (const { node, type, defaultValue } of usages) {
+        for (const {
+          node,
+          type,
+          parentType,
+          defaultValue,
+          fragmentVariableDefinition,
+        } of usages) {
           const varName = node.name.value;
-          const varDef = varDefMap.get(varName);
+          let varDef = fragmentVariableDefinition;
+          if (!varDef) {
+            varDef = varDefMap.get(varName);
+          }
           if (varDef && type) {
             // A var type is allowed if it is the same or more strict (e.g. is
             // a subtype of) than the expected type. It can be more strict if
@@ -49,11 +64,21 @@ export function VariablesInAllowedPositionRule(
                 defaultValue,
               )
             ) {
-              const varTypeStr = inspect(varType);
-              const typeStr = inspect(type);
               context.reportError(
                 new GraphQLError(
-                  `Variable "$${varName}" of type "${varTypeStr}" used in position expecting type "${typeStr}".`,
+                  `Variable "$${varName}" of type "${varType}" used in position expecting type "${type}".`,
+                  { nodes: [varDef, node] },
+                ),
+              );
+            }
+            if (
+              isInputObjectType(parentType) &&
+              parentType.isOneOf &&
+              isNullableType(varType)
+            ) {
+              context.reportError(
+                new GraphQLError(
+                  `Variable "$${varName}" is of type "${varType}" but must be non-nullable to be used for OneOf Input Object "${parentType}".`,
                   { nodes: [varDef, node] },
                 ),
               );
@@ -69,15 +94,18 @@ export function VariablesInAllowedPositionRule(
 }
 /**
  * Returns true if the variable is allowed in the location it was found,
- * which includes considering if default values exist for either the variable
+ * including considering if default values exist for either the variable
  * or the location at which it is located.
+ *
+ * OneOf Input Object Type fields are considered separately above to
+ * provide a more descriptive error message.
  */
 function allowedVariableUsage(
   schema: GraphQLSchema,
   varType: GraphQLType,
   varDefaultValue: Maybe<ValueNode>,
   locationType: GraphQLType,
-  locationDefaultValue: Maybe<unknown>,
+  locationDefaultValue: GraphQLDefaultValueUsage | undefined,
 ): boolean {
   if (isNonNullType(locationType) && !isNonNullType(varType)) {
     const hasNonNullVariableDefaultValue =

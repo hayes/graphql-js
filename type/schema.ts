@@ -2,7 +2,7 @@ import { inspect } from '../jsutils/inspect.ts';
 import { instanceOf } from '../jsutils/instanceOf.ts';
 import type { Maybe } from '../jsutils/Maybe.ts';
 import type { ObjMap } from '../jsutils/ObjMap.ts';
-import { toObjMap } from '../jsutils/toObjMap.ts';
+import { toObjMapWithSymbols } from '../jsutils/toObjMap.ts';
 import type { GraphQLError } from '../error/GraphQLError.ts';
 import type {
   SchemaDefinitionNode,
@@ -55,7 +55,7 @@ export function assertSchema(schema: unknown): GraphQLSchema {
  * an object which can contain all the values you need.
  */
 export interface GraphQLSchemaExtensions {
-  [attributeName: string]: unknown;
+  [attributeName: string | symbol]: unknown;
 }
 /**
  * Schema Definition
@@ -130,7 +130,7 @@ export class GraphQLSchema {
   extensions: Readonly<GraphQLSchemaExtensions>;
   astNode: Maybe<SchemaDefinitionNode>;
   extensionASTNodes: ReadonlyArray<SchemaExtensionNode>;
-  // Used as a cache for validateSchema().
+  assumeValid: boolean;
   __validationErrors: Maybe<ReadonlyArray<GraphQLError>>;
   private _queryType: Maybe<GraphQLObjectType>;
   private _mutationType: Maybe<GraphQLObjectType>;
@@ -148,9 +148,11 @@ export class GraphQLSchema {
   constructor(config: Readonly<GraphQLSchemaConfig>) {
     // If this schema was built from a source known to be valid, then it may be
     // marked with assumeValid to avoid an additional type system validation.
+    this.assumeValid = config.assumeValid ?? false;
+    // Used as a cache for validateSchema().
     this.__validationErrors = config.assumeValid === true ? [] : undefined;
     this.description = config.description;
-    this.extensions = toObjMap(config.extensions);
+    this.extensions = toObjMapWithSymbols(config.extensions);
     this.astNode = config.astNode;
     this.extensionASTNodes = config.extensionASTNodes ?? [];
     this._queryType = config.query;
@@ -346,7 +348,7 @@ export class GraphQLSchema {
       extensions: this.extensions,
       astNode: this.astNode,
       extensionASTNodes: this.extensionASTNodes,
-      assumeValid: this.__validationErrors !== undefined,
+      assumeValid: this.assumeValid,
     };
   }
 }

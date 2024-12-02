@@ -2,10 +2,9 @@ import { inspect } from '../jsutils/inspect.ts';
 import { invariant } from '../jsutils/invariant.ts';
 import { DirectiveLocation } from '../language/directiveLocation.ts';
 import { print } from '../language/printer.ts';
-import { astFromValue } from '../utilities/astFromValue.ts';
+import { valueToLiteral } from '../utilities/valueToLiteral.ts';
 import type {
   GraphQLEnumValue,
-  GraphQLField,
   GraphQLFieldConfigMap,
   GraphQLInputField,
   GraphQLNamedType,
@@ -13,6 +12,7 @@ import type {
 } from './definition.ts';
 import {
   GraphQLEnumType,
+  GraphQLField,
   GraphQLList,
   GraphQLNonNull,
   GraphQLObjectType,
@@ -70,7 +70,7 @@ export const __Schema: GraphQLObjectType = new GraphQLObjectType({
         ),
         resolve: (schema) => schema.getDirectives(),
       },
-    } as GraphQLFieldConfigMap<GraphQLSchema, unknown>),
+    }) as GraphQLFieldConfigMap<GraphQLSchema, unknown>,
 });
 export const __Directive: GraphQLObjectType = new GraphQLObjectType({
   name: '__Directive',
@@ -112,7 +112,7 @@ export const __Directive: GraphQLObjectType = new GraphQLObjectType({
             : field.args.filter((arg) => arg.deprecationReason == null);
         },
       },
-    } as GraphQLFieldConfigMap<GraphQLDirective, unknown>),
+    }) as GraphQLFieldConfigMap<GraphQLDirective, unknown>,
 });
 export const __DirectiveLocation: GraphQLEnumType = new GraphQLEnumType({
   name: '__DirectiveLocation',
@@ -149,7 +149,11 @@ export const __DirectiveLocation: GraphQLEnumType = new GraphQLEnumType({
     },
     VARIABLE_DEFINITION: {
       value: DirectiveLocation.VARIABLE_DEFINITION,
-      description: 'Location adjacent to a variable definition.',
+      description: 'Location adjacent to an operation variable definition.',
+    },
+    FRAGMENT_VARIABLE_DEFINITION: {
+      value: DirectiveLocation.FRAGMENT_VARIABLE_DEFINITION,
+      description: 'Location adjacent to a fragment variable definition.',
     },
     SCHEMA: {
       value: DirectiveLocation.SCHEMA,
@@ -324,7 +328,7 @@ export const __Type: GraphQLObjectType = new GraphQLObjectType({
           }
         },
       },
-    } as GraphQLFieldConfigMap<GraphQLType, unknown>),
+    }) as GraphQLFieldConfigMap<GraphQLType, unknown>,
 });
 export const __Field: GraphQLObjectType = new GraphQLObjectType({
   name: '__Field',
@@ -368,7 +372,7 @@ export const __Field: GraphQLObjectType = new GraphQLObjectType({
         type: GraphQLString,
         resolve: (field) => field.deprecationReason,
       },
-    } as GraphQLFieldConfigMap<GraphQLField<unknown, unknown>, unknown>),
+    }) as GraphQLFieldConfigMap<GraphQLField<unknown, unknown>, unknown>,
 });
 export const __InputValue: GraphQLObjectType = new GraphQLObjectType({
   name: '__InputValue',
@@ -394,8 +398,13 @@ export const __InputValue: GraphQLObjectType = new GraphQLObjectType({
           'A GraphQL-formatted string representing the default value for this input value.',
         resolve(inputValue) {
           const { type, defaultValue } = inputValue;
-          const valueAST = astFromValue(defaultValue, type);
-          return valueAST ? print(valueAST) : null;
+          if (!defaultValue) {
+            return null;
+          }
+          const literal =
+            defaultValue.literal ?? valueToLiteral(defaultValue.value, type);
+          literal != null || invariant(false, 'Invalid default value');
+          return print(literal);
         },
       },
       isDeprecated: {
@@ -406,7 +415,7 @@ export const __InputValue: GraphQLObjectType = new GraphQLObjectType({
         type: GraphQLString,
         resolve: (obj) => obj.deprecationReason,
       },
-    } as GraphQLFieldConfigMap<GraphQLInputField, unknown>),
+    }) as GraphQLFieldConfigMap<GraphQLInputField, unknown>,
 });
 export const __EnumValue: GraphQLObjectType = new GraphQLObjectType({
   name: '__EnumValue',
@@ -430,18 +439,20 @@ export const __EnumValue: GraphQLObjectType = new GraphQLObjectType({
         type: GraphQLString,
         resolve: (enumValue) => enumValue.deprecationReason,
       },
-    } as GraphQLFieldConfigMap<GraphQLEnumValue, unknown>),
+    }) as GraphQLFieldConfigMap<GraphQLEnumValue, unknown>,
 });
-export enum TypeKind {
-  SCALAR = 'SCALAR',
-  OBJECT = 'OBJECT',
-  INTERFACE = 'INTERFACE',
-  UNION = 'UNION',
-  ENUM = 'ENUM',
-  INPUT_OBJECT = 'INPUT_OBJECT',
-  LIST = 'LIST',
-  NON_NULL = 'NON_NULL',
-}
+export const TypeKind = {
+  SCALAR: 'SCALAR' as const,
+  OBJECT: 'OBJECT' as const,
+  INTERFACE: 'INTERFACE' as const,
+  UNION: 'UNION' as const,
+  ENUM: 'ENUM' as const,
+  INPUT_OBJECT: 'INPUT_OBJECT' as const,
+  LIST: 'LIST' as const,
+  NON_NULL: 'NON_NULL' as const,
+} as const;
+// eslint-disable-next-line @typescript-eslint/no-redeclare
+export type TypeKind = (typeof TypeKind)[keyof typeof TypeKind];
 export const __TypeKind: GraphQLEnumType = new GraphQLEnumType({
   name: '__TypeKind',
   description: 'An enum describing what kind of type a given `__Type` is.',
@@ -486,50 +497,22 @@ export const __TypeKind: GraphQLEnumType = new GraphQLEnumType({
     },
   },
 });
-/**
- * Note that these are GraphQLField and not GraphQLFieldConfig,
- * so the format for args is different.
- */
-export const SchemaMetaFieldDef: GraphQLField<unknown, unknown> = {
-  name: '__schema',
+export const SchemaMetaFieldDef = new GraphQLField(undefined, '__schema', {
   type: new GraphQLNonNull(__Schema),
   description: 'Access the current type schema of this server.',
-  args: [],
   resolve: (_source, _args, _context, { schema }) => schema,
-  deprecationReason: undefined,
-  extensions: Object.create(null),
-  astNode: undefined,
-};
-export const TypeMetaFieldDef: GraphQLField<unknown, unknown> = {
-  name: '__type',
+});
+export const TypeMetaFieldDef = new GraphQLField(undefined, '__type', {
   type: __Type,
   description: 'Request the type information of a single type.',
-  args: [
-    {
-      name: 'name',
-      description: undefined,
-      type: new GraphQLNonNull(GraphQLString),
-      defaultValue: undefined,
-      deprecationReason: undefined,
-      extensions: Object.create(null),
-      astNode: undefined,
-    },
-  ],
+  args: { name: { type: new GraphQLNonNull(GraphQLString) } },
   resolve: (_source, { name }, _context, { schema }) => schema.getType(name),
-  deprecationReason: undefined,
-  extensions: Object.create(null),
-  astNode: undefined,
-};
-export const TypeNameMetaFieldDef: GraphQLField<unknown, unknown> = {
-  name: '__typename',
+});
+export const TypeNameMetaFieldDef = new GraphQLField(undefined, '__typename', {
   type: new GraphQLNonNull(GraphQLString),
   description: 'The name of the current Object type at runtime.',
-  args: [],
   resolve: (_source, _args, _context, { parentType }) => parentType.name,
-  deprecationReason: undefined,
-  extensions: Object.create(null),
-  astNode: undefined,
-};
+});
 export const introspectionTypes: ReadonlyArray<GraphQLNamedType> =
   Object.freeze([
     __Schema,

@@ -2,6 +2,8 @@ export { Source } from './source.ts';
 export { getLocation } from './location.ts';
 export type { SourceLocation } from './location.ts';
 export { printLocation, printSourceLocation } from './printLocation.ts';
+// @see https://github.com/typescript-eslint/typescript-eslint/issues/10313
+// eslint-disable-next-line @typescript-eslint/consistent-type-exports
 export { Kind } from './kinds.ts';
 export { TokenKind } from './tokenKind.ts';
 export { Lexer } from './lexer.ts';
@@ -30,11 +32,8 @@ export type {
   SelectionSetNode,
   SelectionNode,
   FieldNode,
-  NullabilityAssertionNode,
-  NonNullAssertionNode,
-  ErrorBoundaryNode,
-  ListNullabilityOperatorNode,
   ArgumentNode,
+  FragmentArgumentNode /* for experimental fragment arguments */,
   ConstArgumentNode,
   FragmentSpreadNode,
   InlineFragmentNode,
@@ -87,7 +86,6 @@ export {
   isDefinitionNode,
   isExecutableDefinitionNode,
   isSelectionNode,
-  isNullabilityAssertionNode,
   isValueNode,
   isConstValueNode,
   isTypeNode,

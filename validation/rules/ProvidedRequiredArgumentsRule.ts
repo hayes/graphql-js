@@ -1,12 +1,16 @@
 import { inspect } from '../../jsutils/inspect.ts';
 import { GraphQLError } from '../../error/GraphQLError.ts';
-import type { InputValueDefinitionNode } from '../../language/ast.ts';
+import type {
+  InputValueDefinitionNode,
+  VariableDefinitionNode,
+} from '../../language/ast.ts';
 import { Kind } from '../../language/kinds.ts';
 import { print } from '../../language/printer.ts';
 import type { ASTVisitor } from '../../language/visitor.ts';
 import type { GraphQLArgument } from '../../type/definition.ts';
 import { isRequiredArgument, isType } from '../../type/definition.ts';
 import { specifiedDirectives } from '../../type/directives.ts';
+import { typeFromAST } from '../../utilities/typeFromAST.ts';
 import type {
   SDLValidationContext,
   ValidationContext,
@@ -31,17 +35,47 @@ export function ProvidedRequiredArgumentsRule(
           return false;
         }
         const providedArgs = new Set(
-          // FIXME: https://github.com/graphql/graphql-js/issues/2203
-          /* c8 ignore next */
           fieldNode.arguments?.map((arg) => arg.name.value),
         );
         for (const argDef of fieldDef.args) {
           if (!providedArgs.has(argDef.name) && isRequiredArgument(argDef)) {
-            const argTypeStr = inspect(argDef.type);
             context.reportError(
               new GraphQLError(
-                `Field "${fieldDef.name}" argument "${argDef.name}" of type "${argTypeStr}" is required, but it was not provided.`,
+                `Argument "${argDef}" of type "${argDef.type}" is required, but it was not provided.`,
                 { nodes: fieldNode },
+              ),
+            );
+          }
+        }
+      },
+    },
+    FragmentSpread: {
+      // Validate on leave to allow for deeper errors to appear first.
+      leave(spreadNode) {
+        const fragmentSignature = context.getFragmentSignature();
+        if (!fragmentSignature) {
+          return false;
+        }
+        const providedArgs = new Set(
+          spreadNode.arguments?.map((arg) => arg.name.value),
+        );
+        for (const [
+          varName,
+          variableDefinition,
+        ] of fragmentSignature.variableDefinitions) {
+          if (
+            !providedArgs.has(varName) &&
+            isRequiredArgumentNode(variableDefinition)
+          ) {
+            const type = typeFromAST(
+              context.getSchema(),
+              variableDefinition.type,
+            );
+            const argTypeStr = inspect(type);
+            context.reportError(
+              new GraphQLError(
+                `Fragment "${spreadNode.name.value}" argument "${varName}" of type "${argTypeStr}" is required, but it was not provided.`,
+                { nodes: spreadNode },
               ),
             );
           }
@@ -73,8 +107,6 @@ export function ProvidedRequiredArgumentsOnDirectivesRule(
   const astDefinitions = context.getDocument().definitions;
   for (const def of astDefinitions) {
     if (def.kind === Kind.DIRECTIVE_DEFINITION) {
-      // FIXME: https://github.com/graphql/graphql-js/issues/2203
-      /* c8 ignore next */
       const argNodes = def.arguments ?? [];
       requiredArgsMap.set(
         def.name.value,
@@ -93,8 +125,6 @@ export function ProvidedRequiredArgumentsOnDirectivesRule(
         const directiveName = directiveNode.name.value;
         const requiredArgs = requiredArgsMap.get(directiveName);
         if (requiredArgs != null) {
-          // FIXME: https://github.com/graphql/graphql-js/issues/2203
-          /* c8 ignore next */
           const argNodes = directiveNode.arguments ?? [];
           const argNodeMap = new Set(argNodes.map((arg) => arg.name.value));
           for (const [argName, argDef] of requiredArgs.entries()) {
@@ -104,7 +134,7 @@ export function ProvidedRequiredArgumentsOnDirectivesRule(
                 : print(argDef.type);
               context.reportError(
                 new GraphQLError(
-                  `Directive "@${directiveName}" argument "${argName}" of type "${argType}" is required, but it was not provided.`,
+                  `Argument "@${directiveName}(${argName}:)" of type "${argType}" is required, but it was not provided.`,
                   { nodes: directiveNode },
                 ),
               );
@@ -115,6 +145,8 @@ export function ProvidedRequiredArgumentsOnDirectivesRule(
     },
   };
 }
-function isRequiredArgumentNode(arg: InputValueDefinitionNode): boolean {
+function isRequiredArgumentNode(
+  arg: InputValueDefinitionNode | VariableDefinitionNode,
+): boolean {
   return arg.type.kind === Kind.NON_NULL_TYPE && arg.defaultValue == null;
 }

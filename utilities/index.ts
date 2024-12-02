@@ -47,15 +47,35 @@ export {
 // Create a GraphQLType from a GraphQL language AST.
 export { typeFromAST } from './typeFromAST.ts';
 // Create a JavaScript value from a GraphQL language AST with a type.
-export { valueFromAST } from './valueFromAST.ts';
+export {
+  /** @deprecated use `coerceInputLiteral()` instead - will be removed in v18 */
+  valueFromAST,
+} from './valueFromAST.ts';
 // Create a JavaScript value from a GraphQL language AST without a type.
 export { valueFromASTUntyped } from './valueFromASTUntyped.ts';
 // Create a GraphQL language AST from a JavaScript value.
-export { astFromValue } from './astFromValue.ts';
+export {
+  /** @deprecated use `valueToLiteral()` instead with care to operate on external values - `astFromValue()` will be removed in v18 */
+  astFromValue,
+} from './astFromValue.ts';
 // A helper to use within recursive-descent visitors which need to be aware of the GraphQL type system.
 export { TypeInfo, visitWithTypeInfo } from './TypeInfo.ts';
-// Coerces a JavaScript value to a GraphQL type, or produces errors.
-export { coerceInputValue } from './coerceInputValue.ts';
+// Converts a value to a const value by replacing variables.
+export { replaceVariables } from './replaceVariables.ts';
+// Create a GraphQL literal (AST) from a JavaScript input value.
+export { valueToLiteral } from './valueToLiteral.ts';
+export {
+  // Coerces a JavaScript value to a GraphQL type, or returns undefined.
+  coerceInputValue,
+  // Coerces a GraphQL literal (AST) to a GraphQL type, or returns undefined.
+  coerceInputLiteral,
+} from './coerceInputValue.ts';
+export {
+  // Validate a JavaScript value with a GraphQL type, collecting all errors.
+  validateInputValue,
+  // Validate a GraphQL literal (AST) with a GraphQL type, collecting all errors.
+  validateInputLiteral,
+} from './validateInputValue.ts';
 // Concatenates multiple AST together.
 export { concatAST } from './concatAST.ts';
 // Separates an AST into an AST per Operation.
@@ -72,9 +92,15 @@ export {
 export {
   BreakingChangeType,
   DangerousChangeType,
+  SafeChangeType,
   findBreakingChanges,
   findDangerousChanges,
-} from './findBreakingChanges.ts';
-export type { BreakingChange, DangerousChange } from './findBreakingChanges.ts';
+  findSchemaChanges,
+} from './findSchemaChanges.ts';
+export type {
+  BreakingChange,
+  DangerousChange,
+  SafeChange,
+} from './findSchemaChanges.ts';
 // Wrapper type that contains DocumentNode and types that can be deduced from it.
 export type { TypedQueryDocumentNode } from './typedQueryDocumentNode.ts';

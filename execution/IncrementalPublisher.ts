@@ -2,6 +2,7 @@ import { invariant } from '../jsutils/invariant.ts';
 import type { ObjMap } from '../jsutils/ObjMap.ts';
 import { pathToArray } from '../jsutils/Path.ts';
 import type { GraphQLError } from '../error/GraphQLError.ts';
+import type { AbortSignalListener } from './AbortSignalListener.ts';
 import { IncrementalGraph } from './IncrementalGraph.ts';
 import type {
   CancellableStreamRecord,
@@ -39,6 +40,7 @@ export function buildIncrementalResponse(
   );
 }
 interface IncrementalPublisherContext {
+  abortSignalListener: AbortSignalListener | undefined;
   cancellableStreams: Set<CancellableStreamRecord> | undefined;
 }
 interface SubsequentIncrementalExecutionResultContext {
@@ -110,6 +112,7 @@ class IncrementalPublisher {
       IteratorResult<SubsequentIncrementalExecutionResult, void>
     > => {
       if (isDone) {
+        this._context.abortSignalListener?.disconnect();
         await this._returnAsyncIteratorsIgnoringErrors();
         return { value: undefined, done: true };
       }
@@ -147,6 +150,9 @@ class IncrementalPublisher {
         // eslint-disable-next-line no-await-in-loop
         batch = await this._incrementalGraph.nextCompletedBatch();
       } while (batch !== undefined);
+      // TODO: add test for this case
+      /* c8 ignore next */
+      this._context.abortSignalListener?.disconnect();
       await this._returnAsyncIteratorsIgnoringErrors();
       return { value: undefined, done: true };
     };
@@ -164,6 +170,7 @@ class IncrementalPublisher {
       isDone = true;
       this._incrementalGraph.abort();
       await this._returnAsyncIterators();
+      // eslint-disable-next-line @typescript-eslint/prefer-promise-reject-errors
       return Promise.reject(error);
     };
     return {
