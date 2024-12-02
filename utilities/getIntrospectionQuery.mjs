@@ -3,36 +3,36 @@
  * Accepts optional IntrospectionOptions.
  */
 export function getIntrospectionQuery(options) {
-  const optionsWithDefault = {
-    descriptions: true,
-    specifiedByUrl: false,
-    directiveIsRepeatable: false,
-    schemaDescription: false,
-    inputValueDeprecation: false,
-    oneOf: false,
-    ...options,
-  };
-  const descriptions = optionsWithDefault.descriptions ? 'description' : '';
-  const specifiedByUrl = optionsWithDefault.specifiedByUrl
-    ? 'specifiedByURL'
-    : '';
-  const directiveIsRepeatable = optionsWithDefault.directiveIsRepeatable
-    ? 'isRepeatable'
-    : '';
-  const schemaDescription = optionsWithDefault.schemaDescription
-    ? descriptions
-    : '';
-  function inputDeprecation(str) {
-    return optionsWithDefault.inputValueDeprecation ? str : '';
-  }
-  const oneOf = optionsWithDefault.oneOf ? 'isOneOf' : '';
-  return `
+    const optionsWithDefault = {
+        descriptions: true,
+        specifiedByUrl: false,
+        directiveIsRepeatable: false,
+        schemaDescription: false,
+        inputValueDeprecation: false,
+        oneOf: false,
+        ...options,
+    };
+    const descriptions = optionsWithDefault.descriptions ? 'description' : '';
+    const specifiedByUrl = optionsWithDefault.specifiedByUrl
+        ? 'specifiedByURL'
+        : '';
+    const directiveIsRepeatable = optionsWithDefault.directiveIsRepeatable
+        ? 'isRepeatable'
+        : '';
+    const schemaDescription = optionsWithDefault.schemaDescription
+        ? descriptions
+        : '';
+    function inputDeprecation(str) {
+        return optionsWithDefault.inputValueDeprecation ? str : '';
+    }
+    const oneOf = optionsWithDefault.oneOf ? 'isOneOf' : '';
+    return `
     query IntrospectionQuery {
       __schema {
         ${schemaDescription}
-        queryType { name }
-        mutationType { name }
-        subscriptionType { name }
+        queryType { name kind }
+        mutationType { name kind }
+        subscriptionType { name kind }
         types {
           ...FullType
         }
@@ -134,3 +134,4 @@ export function getIntrospectionQuery(options) {
     }
   `;
 }
+//# sourceMappingURL=getIntrospectionQuery.js.map

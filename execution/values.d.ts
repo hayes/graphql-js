@@ -1,25 +1,26 @@
 import type { Maybe } from '../jsutils/Maybe.js';
-import type { ObjMap } from '../jsutils/ObjMap.js';
+import type { ReadOnlyObjMap } from '../jsutils/ObjMap.js';
 import { GraphQLError } from '../error/GraphQLError.js';
-import type {
-  DirectiveNode,
-  FieldNode,
-  VariableDefinitionNode,
-} from '../language/ast.js';
-import type { GraphQLField } from '../type/definition.js';
+import type { DirectiveNode, FieldNode, FragmentSpreadNode, VariableDefinitionNode } from '../language/ast.js';
+import type { GraphQLArgument, GraphQLField } from '../type/definition.js';
 import type { GraphQLDirective } from '../type/directives.js';
 import type { GraphQLSchema } from '../type/schema.js';
-type CoercedVariableValues =
-  | {
-      errors: ReadonlyArray<GraphQLError>;
-      coerced?: never;
-    }
-  | {
-      coerced: {
-        [variable: string]: unknown;
-      };
-      errors?: never;
-    };
+import type { GraphQLVariableSignature } from './getVariableSignature.js';
+export interface VariableValues {
+    readonly sources: ReadOnlyObjMap<VariableValueSource>;
+    readonly coerced: ReadOnlyObjMap<unknown>;
+}
+interface VariableValueSource {
+    readonly signature: GraphQLVariableSignature;
+    readonly value?: unknown;
+}
+type VariableValuesOrErrors = {
+    variableValues: VariableValues;
+    errors?: never;
+} | {
+    errors: ReadonlyArray<GraphQLError>;
+    variableValues?: never;
+};
 /**
  * Prepares an object map of variableValues of the correct type based on the
  * provided variable definitions and arbitrary input. If the input cannot be
@@ -29,16 +30,13 @@ type CoercedVariableValues =
  * exposed to user code. Care should be taken to not pull values from the
  * Object prototype.
  */
-export declare function getVariableValues(
-  schema: GraphQLSchema,
-  varDefNodes: ReadonlyArray<VariableDefinitionNode>,
-  inputs: {
+export declare function getVariableValues(schema: GraphQLSchema, varDefNodes: ReadonlyArray<VariableDefinitionNode>, inputs: {
     readonly [variable: string]: unknown;
-  },
-  options?: {
+}, options?: {
     maxErrors?: number;
-  },
-): CoercedVariableValues;
+    hideSuggestions?: boolean;
+}): VariableValuesOrErrors;
+export declare function getFragmentVariableValues(fragmentSpreadNode: FragmentSpreadNode, fragmentSignatures: ReadOnlyObjMap<GraphQLVariableSignature>, variableValues: VariableValues, fragmentVariableValues?: Maybe<VariableValues>, hideSuggestions?: Maybe<boolean>): VariableValues;
 /**
  * Prepares an object map of argument values given a list of argument
  * definitions and list of argument AST nodes.
@@ -47,12 +45,11 @@ export declare function getVariableValues(
  * exposed to user code. Care should be taken to not pull values from the
  * Object prototype.
  */
-export declare function getArgumentValues(
-  def: GraphQLField<unknown, unknown> | GraphQLDirective,
-  node: FieldNode | DirectiveNode,
-  variableValues?: Maybe<ObjMap<unknown>>,
-): {
-  [argument: string]: unknown;
+export declare function getArgumentValues(def: GraphQLField<unknown, unknown> | GraphQLDirective, node: FieldNode | DirectiveNode, variableValues?: Maybe<VariableValues>, hideSuggestions?: Maybe<boolean>): {
+    [argument: string]: unknown;
+};
+export declare function experimentalGetArgumentValues(node: FieldNode | DirectiveNode | FragmentSpreadNode, argDefs: ReadonlyArray<GraphQLArgument | GraphQLVariableSignature>, variableValues: Maybe<VariableValues>, fragmentVariableValues?: Maybe<VariableValues>, hideSuggestions?: Maybe<boolean>): {
+    [argument: string]: unknown;
 };
 /**
  * Prepares an object map of argument values given a directive definition
@@ -65,15 +62,9 @@ export declare function getArgumentValues(
  * exposed to user code. Care should be taken to not pull values from the
  * Object prototype.
  */
-export declare function getDirectiveValues(
-  directiveDef: GraphQLDirective,
-  node: {
+export declare function getDirectiveValues(directiveDef: GraphQLDirective, node: {
     readonly directives?: ReadonlyArray<DirectiveNode> | undefined;
-  },
-  variableValues?: Maybe<ObjMap<unknown>>,
-):
-  | undefined
-  | {
-      [argument: string]: unknown;
-    };
+}, variableValues?: Maybe<VariableValues>, fragmentVariableValues?: Maybe<VariableValues>, hideSuggestions?: Maybe<boolean>): undefined | {
+    [argument: string]: unknown;
+};
 export {};

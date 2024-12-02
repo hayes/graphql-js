@@ -3,13 +3,14 @@
 /**
  * A string containing the version of the GraphQL.js library
  */
-export const version = '17.0.0-alpha.5';
+export const version = '17.0.0-alpha.7';
 /**
  * An object containing the components of the GraphQL.js version string
  */
 export const versionInfo = Object.freeze({
-  major: 17,
-  minor: 0,
-  patch: 0,
-  preReleaseTag: 'alpha.5',
+    major: 17,
+    minor: 0,
+    patch: 0,
+    preReleaseTag: 'alpha.7',
 });
+//# sourceMappingURL=version.js.map
